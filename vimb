@@ -90,6 +90,8 @@ set ttimeout
 set ttimeoutlen=100
 
 highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
+highlight default VimbCurrentLine cterm=bold ctermbg=238 ctermfg=15
+            \ gui=bold guibg=#535e6b guifg=#ffffff
 highlight default link VimbHash Comment
 
 let s:git_root = $VIMB_GIT_ROOT
@@ -310,10 +312,10 @@ function! s:CurrentRecord() abort
 endfunction
 
 function! s:HighlightCommit() abort
-    if exists('w:vimb_same_match') && w:vimb_same_match > 0
-        silent! call matchdelete(w:vimb_same_match)
-    endif
-    let w:vimb_same_match = -1
+    for l:id in get(w:, 'vimb_match_ids', [])
+        silent! call matchdelete(l:id)
+    endfor
+    let w:vimb_match_ids = []
     let l:record = s:CurrentRecord()
     if empty(l:record)
         return
@@ -324,9 +326,12 @@ function! s:HighlightCommit() abort
             call add(l:positions, [l:index + 1])
         endif
     endfor
+    " 同 commit 色块优先级 10，会盖过 cursorline(优先级 2)；
+    " 所在行再用优先级 20 叠加更醒目的高亮，避免淹没在色块中。
     if !empty(l:positions)
-        let w:vimb_same_match = matchaddpos('VimbSameCommit', l:positions, 10)
+        call add(w:vimb_match_ids, matchaddpos('VimbSameCommit', l:positions, 10))
     endif
+    call add(w:vimb_match_ids, matchaddpos('VimbCurrentLine', [line('.')], 20))
 endfunction
 
 function! s:FileLine() abort
