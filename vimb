@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 
 usage() {
     cat <<'EOF'
@@ -48,11 +48,6 @@ case "${1:-}" in
         ;;
 esac
 
-if [ "${1:-}" = "--" ]; then
-    shift
-fi
-
-# blame 附加选项：-w / -M / -C / --blame-args
 BLAME_EXTRA_ARGS=''
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -68,6 +63,10 @@ while [ $# -gt 0 ]; do
         --blame-args=*)
             BLAME_EXTRA_ARGS="$BLAME_EXTRA_ARGS ${1#--blame-args=}"
             shift
+            ;;
+        --)
+            shift
+            break
             ;;
         *)
             break
@@ -184,6 +183,7 @@ endif
 let s:git_root = $VIMB_GIT_ROOT
 let s:rel_path = $VIMB_REL_PATH
 let s:file_path = $VIMB_FILE
+let s:file_filetype = &l:filetype
 let s:file_bufnr = bufnr('%')
 let s:source_winid = win_getid()
 " blame 历史栈：层 0 为工作区，Tab 入栈后为历史 commit 层。
@@ -211,6 +211,47 @@ let s:job_seq = 0
 let s:blame_gen = 0
 let s:commit_gen = 0
 let s:commit_cache = {}
+
+" Git 对非 ASCII / 特殊字符路径默认输出 C-style quoting（"\344\270..."），
+" 统一加 -c core.quotePath=false 让 blame/diff/show 输出明文路径，
+" 残余 quoting（控制字符、引号等）再由 DecodeGitQuotedPath 解码。
+function! s:GitBase() abort
+    return 'env LC_ALL=C git -c core.quotePath=false --no-pager -C '
+                \ . shellescape(s:git_root)
+endfunction
+
+" 解码 Git C-style quoted 路径："\344\270\255" → UTF-8 明文
+function! s:DecodeGitQuotedPath(path) abort
+    if a:path !~# '^"'
+        return a:path
+    endif
+    let l:raw = a:path[1 : -2]
+    let l:out = ''
+    let l:i = 0
+    while l:i < len(l:raw)
+        let l:ch = l:raw[l:i]
+        if l:ch ==# '\' && l:i + 1 < len(l:raw)
+            let l:n = l:raw[l:i + 1]
+            if l:n =~# '[0-7]' && l:i + 3 < len(l:raw)
+                        \ && l:raw[l:i + 2] =~# '[0-7]' && l:raw[l:i + 3] =~# '[0-7]'
+                let l:out .= nr2char(str2nr(l:raw[l:i+1 : l:i+3], 8))
+                let l:i += 4
+                continue
+            elseif l:n ==# 'n'
+                let l:out .= "\n"
+            elseif l:n ==# 't'
+                let l:out .= "\t"
+            else
+                let l:out .= l:n
+            endif
+            let l:i += 2
+        else
+            let l:out .= l:ch
+            let l:i += 1
+        endif
+    endwhile
+    return l:out
+endfunction
 
 function! s:Error(message) abort
     echohl ErrorMsg
@@ -342,7 +383,7 @@ let s:blame_args = $VIMB_BLAME_ARGS
 
 " ---- blame ----------------------------------------------------------------
 function! s:BlameCmd(commit, path) abort
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+    let l:cmd = s:GitBase()
                 \ . ' blame --no-ext-diff --no-textconv --line-porcelain'
     if s:blame_args !=# ''
         let l:cmd .= ' ' . join(map(split(s:blame_args),
@@ -386,10 +427,10 @@ function! s:ParseBlameLines(lines) abort
             let l:prev = matchlist(strpart(l:raw, 9), '^\(\x\{40,64}\) \(.*\)$')
             if !empty(l:prev)
                 let l:record.previous = l:prev[1]
-                let l:record.previous_path = l:prev[2]
+                let l:record.previous_path = s:DecodeGitQuotedPath(l:prev[2])
             endif
         elseif stridx(l:raw, 'filename ') == 0
-            let l:record.filename = strpart(l:raw, 9)
+            let l:record.filename = s:DecodeGitQuotedPath(strpart(l:raw, 9))
         elseif stridx(l:raw, "\t") == 0
             let l:record.text = strpart(l:raw, 1)
             call add(l:records, l:record)
@@ -407,7 +448,7 @@ function! s:CurrentPath() abort
 endfunction
 
 function! s:ShowCommitCmd(hash, file_only) abort
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+    let l:cmd = s:GitBase()
                 \ . ' show --no-color --no-ext-diff --no-textconv'
                 \ . ' --format=fuller --decorate=no --stat --patch '
                 \ . shellescape(a:hash) . ' --'
@@ -982,33 +1023,86 @@ function! s:Refresh(notify) abort
 endfunction
 
 " ---- blame 历史栈 ----------------------------------------------------------
-" git show <commit>:<path>：读取某次提交时的文件内容（同步，单对象读取很快）
-function! s:GitShowFileLines(commit, path) abort
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
-                \ . ' show ' . shellescape(a:commit . ':' . a:path) . ' 2>&1'
-    let l:done = []
-    call s:GitLines(l:cmd, {ok, lines -> add(l:done, ok ? lines : [])})
-    " s:GitLines 同步模式下立即回调；异步模式下单对象读取也近乎即时，
-    " 这里用带超时的等待保证两条路径行为一致。
-    let l:rounds = 0
-    while empty(l:done) && l:rounds < 3000
-        sleep 10m
-        let l:rounds += 1
-    endwhile
-    return get(l:done, 0, [])
+" P0 正确性：original_line 是子 commit 中的行号，不等于父 commit 中对应
+" 旧行的行号（父版本前后可能有插入/删除）。这里通过
+"   git diff --unified=0 <prev>:<prev_path> <cur>:<cur_path>
+" 的 hunk 头建立 child→parent 行映射；落在新增区（old_count == 0）的行
+" 是本 commit 首次引入，返回 -1（Tab 应提示而不是误追）。
+function! s:MapChildLineToParent(diff_lines, child_line) abort
+    let l:hunks = []
+    for l:raw in a:diff_lines
+        let l:m = matchlist(l:raw,
+                    \ '^@@ -\(\d\+\)\%(,\(\d\+\)\)\? +\(\d\+\)\%(,\(\d\+\)\)\? @@')
+        if !empty(l:m)
+            call add(l:hunks, {
+                        \ 'old_start': str2nr(l:m[1]),
+                        \ 'old_count': l:m[2] ==# '' ? 1 : str2nr(l:m[2]),
+                        \ 'new_start': str2nr(l:m[3]),
+                        \ 'new_count': l:m[4] ==# '' ? 1 : str2nr(l:m[4])})
+        endif
+    endfor
+    if empty(l:hunks)
+        return a:child_line
+    endif
+    " 行号偏移累计：child_line = parent_line + offset（相邻 hunk 之间）
+    let l:offset = 0
+    for l:h in l:hunks
+        let l:child_end = l:h.new_start + l:h.new_count - 1
+        if a:child_line < l:h.new_start + l:offset
+            " 位于该 hunk 之前的未改动区：parent = child - offset
+            return a:child_line - l:offset
+        endif
+        if a:child_line <= l:child_end + l:offset
+            " 位于本 hunk 改动区内
+            if l:h.old_count == 0
+                return -1   " 新增行：本 commit 首次引入
+            endif
+            return l:h.old_start + (a:child_line - l:offset - l:h.new_start)
+        endif
+        " hunk 之后：更新偏移继续找
+        let l:offset += l:h.new_count - l:h.old_count
+        if l:offset < 0
+            let l:offset = 0
+        endif
+    endfor
+    return a:child_line - l:offset
 endfunction
 
-" 取历史版本缓冲区（懒创建并缓存）
-function! s:EnsureSrcBuffer(commit, path) abort
+" 取子/父两个版本间的 diff hunk（异步）；回调 on_done(ok, parent_line, lines)
+" parent_line == -1 表示该行为本 commit 新增
+function! s:ChildToParentLineAsync(child_commit, child_path, record, on_done) abort
+    let l:prev = a:record.previous
+    let l:prev_path = get(a:record, 'previous_path', '')
+    if l:prev_path ==# ''
+        let l:prev_path = a:child_path
+    endif
+    let l:cmd = s:GitBase() . ' diff --unified=0 '
+                \ . shellescape(l:prev . ':' . l:prev_path) . ' '
+                \ . shellescape(a:child_commit . ':' . a:child_path) . ' 2>&1'
+    call s:GitLines(l:cmd, {ok, lines ->
+                \ call(a:on_done, [ok, s:MapChildLineToParent(lines,
+                \     get(a:record, 'original_line', 1)), lines])})
+endfunction
+
+" git show <commit>:<path> 异步读取文件内容；回调 on_done(ok, lines)
+function! s:GitShowFileAsync(commit, path, on_done) abort
+    let l:cmd = s:GitBase()
+                \ . ' show ' . shellescape(a:commit . ':' . a:path) . ' 2>&1'
+    call s:GitLines(l:cmd, a:on_done)
+endfunction
+
+" 取历史版本缓冲区（懒创建并缓存）。同步读取已移除：内容由调用方经
+" GitShowFileAsync 取得后经 CreateSrcBuffer 落地。
+function! s:CreateSrcBuffer(commit, path, lines) abort
     let l:key = a:commit . ':' . a:path
     if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
         return s:src_bufs[l:key]
     endif
-    let l:lines = s:GitShowFileLines(a:commit, a:path)
     let l:bufnr = bufadd('[vimb-src @' . strpart(a:commit, 0, 10) . ' '
                 \ . fnamemodify(a:path, ':t') . ']')
     call bufload(l:bufnr)
     " 去掉行尾 \r，与真实文件窗口的显示保持一致
+    let l:lines = copy(a:lines)
     call map(l:lines, 'substitute(v:val, "\r$", "", "")')
     call setbufline(l:bufnr, 1, empty(l:lines) ? [''] : l:lines)
     call setbufvar(l:bufnr, '&buftype', 'nofile')
@@ -1018,6 +1112,9 @@ function! s:EnsureSrcBuffer(commit, path) abort
     call setbufvar(l:bufnr, '&modified', 0)
     call setbufvar(l:bufnr, '&modeline', 0)
     call setbufvar(l:bufnr, '&undolevels', -1)
+    if s:file_filetype !=# ''
+        call setbufvar(l:bufnr, '&filetype', s:file_filetype)
+    endif
     call setbufvar(l:bufnr, 'vimb_src', 1)
     let s:src_bufs[l:key] = l:bufnr
     return l:bufnr
@@ -1081,21 +1178,64 @@ function! s:PushOlder() abort
         call s:Info('该行已追溯到最早引入它的提交（boundary）')
         return
     endif
-    let l:prev = l:record.previous
-    let l:prev_path = get(l:record, 'previous_path', '')
-    if l:prev_path ==# ''
-        let l:prev_path = s:stack[-1].path
+    let l:cur_layer = s:stack[-1]
+    let l:child_commit = l:cur_layer.commit
+    let l:child_path = l:cur_layer.path
+    if l:child_commit ==# ''
+        " 工作区层：以 HEAD 上的该文件为子版本做 diff
+        let l:child_commit = 'HEAD'
     endif
-    let l:line = get(l:record, 'original_line', 1)
-    let l:bufnr = s:EnsureSrcBuffer(l:prev, l:prev_path)
-    if l:bufnr <= 0
-        call s:Error('无法读取 ' . strpart(l:prev, 0, 10) . ' 版本的文件内容')
+    " 全异步链：diff hunk 映射 → 读取父版本内容 → 建缓冲区 → 入栈
+    call s:ChildToParentLineAsync(l:child_commit, l:child_path, l:record,
+                \ {ok, parent_line, diff_lines ->
+                \     s:PushOlderAfterMap(ok, parent_line, l:record,
+                \         l:cur_layer)})
+endfunction
+
+" diff 映射完成后：校验行号是否有效，再异步取父版本内容
+function! s:PushOlderAfterMap(ok, parent_line, record, cur_layer) abort
+    if !a:ok
+        call s:Error('无法计算父版本行号（git diff 失败）')
         return
     endif
+    if a:parent_line <= 0
+        call s:Info('该行在 commit ' . strpart(a:record.hash, 0, 10)
+                    \ . ' 中首次引入，没有更早的来源')
+        return
+    endif
+    let l:prev = a:record.previous
+    let l:prev_path = get(a:record, 'previous_path', '')
+    if l:prev_path ==# ''
+        let l:prev_path = a:cur_layer.path
+    endif
+    " 已有缓存缓冲区可直接入栈；否则异步读取内容
+    let l:key = l:prev . ':' . l:prev_path
+    if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
+        call s:FinishPush(l:prev, l:prev_path, s:src_bufs[l:key],
+                    \ a:parent_line, a:cur_layer)
+        return
+    endif
+    call s:Info('正在追溯 ' . strpart(l:prev, 0, 10) . ' …')
+    call s:GitShowFileAsync(l:prev, l:prev_path,
+                \ {ok, lines -> s:PushOlderAfterShow(ok, lines, l:prev,
+                \     l:prev_path, a:parent_line, a:cur_layer)})
+endfunction
+
+function! s:PushOlderAfterShow(ok, lines, prev, prev_path, parent_line, cur_layer) abort
+    if !a:ok
+        call s:Error('无法读取 ' . strpart(a:prev, 0, 10) . ' 版本的文件内容')
+        return
+    endif
+    let l:bufnr = s:CreateSrcBuffer(a:prev, a:prev_path, a:lines)
+    call s:FinishPush(a:prev, a:prev_path, l:bufnr, a:parent_line, a:cur_layer)
+endfunction
+
+function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer) abort
     " 记录当前层光标行，出栈时恢复
     let s:stack[-1].line = s:FileLine()
-    call add(s:stack, {'commit': l:prev, 'path': l:prev_path,
-                \ 'bufnr': l:bufnr, 'records': [], 'line': l:line, 'mtime': -1})
+    call add(s:stack, {'commit': a:prev, 'path': a:prev_path,
+                \ 'bufnr': a:bufnr, 'records': [], 'line': a:parent_line,
+                \ 'mtime': -1})
     let l:layer = s:stack[-1]
     let l:sw = s:SourceWin()
     if !l:sw || !s:ShowLayerInSource(l:layer)
@@ -1103,10 +1243,11 @@ function! s:PushOlder() abort
         call s:Error('源窗口已不存在，无法入栈')
         return
     endif
-    let l:count = len(getbufline(l:bufnr, 1, '$'))
+    let l:count = len(getbufline(a:bufnr, 1, '$'))
     call win_execute(l:sw,
-                \ 'call cursor(min([' . l:line . ', ' . l:count . ']), 1)')
+                \ 'call cursor(min([' . a:parent_line . ', ' . l:count . ']), 1)')
     call s:UpdateBlameStatusline()
+    call s:UpdateCompactStatusline()
     call s:BlameRequest('push', 0)
 endfunction
 
@@ -1248,6 +1389,8 @@ function! s:OpenBottomPanel(configure_fn) abort
 endfunction
 
 function! s:CloseHistory() abort
+    " 主动失效在途回调，防止关闭后晚到的异步结果再写窗口
+    let s:history_gen += 1
     if s:WindowMatches(s:history_winid, -1)
         if win_getid() == s:history_winid
             silent! close!
@@ -1260,6 +1403,7 @@ function! s:CloseHistory() abort
 endfunction
 
 function! s:HistoryGone() abort
+    let s:history_gen += 1
     let s:history_winid = -1
     let s:history_bufnr = -1
 endfunction
@@ -1280,7 +1424,7 @@ function! s:ShowFileHistory() abort
     let l:gen = s:history_gen
     " --follow 让 rename 后仍能追到旧文件的历史；format 串必须整体
     " 引号包裹，否则 %h 等会被 sh 展开
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+    let l:cmd = s:GitBase()
                 \ . " log --follow --pretty=format:'%h|%an|%ad|%s' --date=short"
     if l:commit !=# ''
         let l:cmd .= ' ' . shellescape(l:commit)
@@ -1305,8 +1449,14 @@ function! s:ShowLineHistory() abort
     call win_execute(l:hw, 'call s:ReplaceCurrentBuffer(["' . l:title . '", "' . l:rule . '", "", "(正在加载行历史 …)"])')
     let s:history_gen += 1
     let l:gen = s:history_gen
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
-                \ . ' log -L ' . l:line . ',' . l:line . ':'
+    " 历史层从当前 revision 起算（HEAD 视角可能已不存在旧路径）
+    let l:commit = empty(s:stack) ? '' : s:stack[-1].commit
+    let l:cmd = s:GitBase()
+                \ . ' log'
+    if l:commit !=# ''
+        let l:cmd .= ' ' . shellescape(l:commit)
+    endif
+    let l:cmd .= ' -L ' . l:line . ',' . l:line . ':'
                 \ . shellescape(l:path)
                 \ . " --pretty=format:'COMMIT@%h|%an|%ad|%s'"
                 \ . ' --date=short 2>&1'
@@ -1316,10 +1466,9 @@ function! s:ShowLineHistory() abort
 endfunction
 
 function! s:HistoryRendered(kind, ok, lines, gen, hw, title, rule, path) abort
-    if a:gen != s:history_gen
-        return
-    endif
-    if s:WindowMatches(a:hw, -1) && winbufnr(a:hw) != s:history_bufnr
+    " 窗口可能已被用户关闭（异步回调晚到）：gen 与窗口双校验，
+    " 任何一项不满足都直接丢弃，绝不向失效窗口写入
+    if a:gen != s:history_gen || !s:WindowMatches(a:hw, s:history_bufnr)
         return
     endif
     if !a:ok
@@ -1697,11 +1846,26 @@ function! s:YankHash() abort
 endfunction
 
 " o：在浏览器打开 commit
+" Web 基址覆盖优先级：VIMB_WEB_BASE_URL 环境变量 > git config vimb.webBaseUrl
+" （Gerrit 的 SSH 端口 29418 无法直接推出 Web 端口，自建实例建议配置其一）
 let s:remote_url = ''
+function! s:WebBaseOverride() abort
+    if $VIMB_WEB_BASE_URL !=# ''
+        return $VIMB_WEB_BASE_URL
+    endif
+    let l:cfg = systemlist('git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' config --get vimb.webBaseUrl 2>/dev/null')
+    if !v:shell_error && !empty(l:cfg) && l:cfg[0] !=# ''
+        return substitute(l:cfg[0], '/$', '', '')
+    endif
+    return ''
+endfunction
+
 function! s:CommitWebURL(hash) abort
     if a:hash =~# '^0\+$'
         return ''
     endif
+    let l:base = s:WebBaseOverride()
     if s:remote_url ==# ''
         let l:out = systemlist('git --no-pager -C ' . shellescape(s:git_root)
                     \ . ' remote get-url origin 2>/dev/null')
@@ -1711,8 +1875,12 @@ function! s:CommitWebURL(hash) abort
         let s:remote_url = l:out[0]
     endif
     let l:url = s:remote_url
-    " git@host:path(.git) / ssh://git@host/path(.git) / https://host/path(.git)
-    let l:m = matchlist(l:url, '^\%(ssh://\)\?git@\([^:/]\+\)[/:]\(.\+\)$')
+    " ssh://user@host:port/path(.git)（Gerrit 常见 user 非 git、端口 29418）
+    let l:m = matchlist(l:url, '^ssh://[^@/]\+@\([^:/]\+\)\%(:\d\+\)\?/\(.\+\)$')
+    if empty(l:m)
+        " user@host:path(.git)（scp 风格）
+        let l:m = matchlist(l:url, '^\%(ssh://\)\?[^@/]\+@\([^:/]\+\)[/:]\(.\+\)$')
+    endif
     if empty(l:m)
         let l:m = matchlist(l:url, '^https\?://\([^/]\+\)/\(.\+\)$')
     endif
@@ -1721,6 +1889,11 @@ function! s:CommitWebURL(hash) abort
     endif
     let l:host = l:m[1]
     let l:path = substitute(l:m[2], '\.git$', '', '')
+    " Gerrit：优先用显式 Web 基址（SSH host 可能与 Web host 不同）
+    if l:host =~# '^gerrit\.\|[-.]gerrit\.' || l:base !=# ''
+        let l:root = (l:base !=# '' ? l:base : 'https://' . l:host)
+        return l:root . '/c/' . l:path . '/+/' . a:hash
+    endif
     if l:host =~# '\<github\.com$'
         return 'https://' . l:host . '/' . l:path . '/commit/' . a:hash
     elseif l:host =~# '\<gitlab\.[^./]*\|\<gitlab\>'
@@ -1731,8 +1904,6 @@ function! s:CommitWebURL(hash) abort
         return 'https://' . l:host . '/' . l:path . '/commits/' . a:hash
     elseif l:host =~# '\<sr\.ht$'
         return 'https://' . l:host . '/' . l:path . '/commit/' . a:hash
-    elseif l:host =~# '^gerrit\.\|[-.]gerrit\.'
-        return 'https://' . l:host . '/c/' . l:path . '/+/' . a:hash
     endif
     throw '未识别的远端类型: ' . l:url
 endfunction

@@ -61,9 +61,47 @@ build_fixture() {
     mgit add old_name.txt
     with_env '2020-02-03T00:00:00' 'Dana Dev' 'dana@example.com' \
         commit -m 'extend old_name'
+    printf 'r line 1\nr line 2 MODIFIED\nr line 3 added later\n' >"$FIXTURE/old_name.txt"
+    mgit add old_name.txt
+    with_env '2020-02-04T00:00:00' 'Eve Editor' 'eve@example.com' \
+        commit -m 'modify second line'
     mgit mv old_name.txt new_name.txt
     with_env '2022-03-03T00:00:00' 'Alice Author' 'alice@example.com' \
         commit -m 'rename to new_name'
+
+    # line-shift 场景：父版本 3 行，子版本在头部插入 1 行（target 移到第 3 行）
+    printf 'a\ntarget\nz\n' >"$FIXTURE/shift.txt"
+    mgit add shift.txt
+    with_env '2021-01-01T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'shift base'
+    printf 'new\na\ntarget2\nz\n' >"$FIXTURE/shift.txt"
+    mgit add shift.txt
+    with_env '2021-01-02T00:00:00' 'Bob Builder' 'bob@example.com' \
+        commit -m 'shift insert head'
+
+    # UTF-8 rename 场景：中文旧名 → 中文新名
+    printf 'u line 1\nu line 2\n' >"$FIXTURE/旧文件.c"
+    mgit add 旧文件.c
+    with_env '2021-02-01T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'add utf8 old'
+    printf 'u line 1\nu line 2 MODIFIED\n' >"$FIXTURE/旧文件.c"
+    mgit add 旧文件.c
+    with_env '2021-02-02T00:00:00' 'Frank Fixer' 'frank@example.com' \
+        commit -m 'modify utf8 old'
+    mgit mv 旧文件.c 新文件.c
+    with_env '2021-02-03T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'rename utf8'
+
+    # Gerrit SSH 远端场景（单独仓库，不设真实 origin）
+    mkdir -p "$WORK/gerrit-repo"
+    git init "$WORK/gerrit-repo" >/dev/null 2>&1
+    git -C "$WORK/gerrit-repo" config user.name G
+    git -C "$WORK/gerrit-repo" config user.email g@x.com
+    printf 'g1\ng2\n' >"$WORK/gerrit-repo/g.txt"
+    git -C "$WORK/gerrit-repo" add g.txt
+    git -C "$WORK/gerrit-repo" commit -m ginit >/dev/null
+    git -C "$WORK/gerrit-repo" remote add origin \
+        ssh://huang@gerrit.example.com:29418/platform/frameworks/base
 
     # 各种边界文件
     printf '中文一\n中文二\n' >"$FIXTURE/中文文件名.txt"
@@ -101,7 +139,12 @@ build_fixture() {
 # ---------------------------------------------------------------------------
 run_case() { # run_case <名称> <文件> <用例脚本> [noauto] [额外env]
     local name=$1 file=$2 script=$3 mode=${4:-} extra=${5:-}
-    [ -f "$FIXTURE/$file" ] || { log "SKIP $name (fixture 缺少 $file)"; return; }
+    case "$file" in
+        /*) [ -f "$file" ] || { log "SKIP $name (缺少 $file)"; return; } ;;
+        *)  [ -f "$FIXTURE/$file" ] || { log "SKIP $name (fixture 缺少 $file)"; return; }
+            file="$FIXTURE/$file" ;;
+    esac
+    local target=$file
 
     local out="$RESULTS/$name.out"
     rm -f "$out"
@@ -117,7 +160,7 @@ so $CASES_DIR/$script")
     fi
 
     local rc=0
-    timeout 60 env "${env[@]}" "$VIMB" "$FIXTURE/$file" </dev/null >/dev/null 2>&1 || rc=$?
+    timeout 60 env "${env[@]}" "$VIMB" "$target" </dev/null >/dev/null 2>&1 || rc=$?
 
     if [ "$rc" -eq 124 ]; then
         log "FAIL $name (超时)"
@@ -160,7 +203,13 @@ stack_rename:new_name.txt:stack_rename.vim:
 keys:code.c:keys.vim:
 history:code.c:history.vim:
 blameargs:code.c:blameargs.vim::VIMB_BLAME_ARGS=-w
-visual:code.c:visual.vim:'
+visual:code.c:visual.vim:
+stack_line_shift:shift.txt:stack_line_shift.vim:
+stack_new_line:shift.txt:stack_new_line.vim:
+stack_utf8_rename:新文件.c:stack_utf8_rename.vim:
+history_close_race:code.c:history_close_race.vim:
+line_history_stack:code.c:line_history_stack.vim:
+gerrit_remote:WORK/gerrit-repo/g.txt:gerrit_remote.vim:'
 
 # ALL_CASES 为冒号分隔的多行串：名称:文件:用例脚本[:noauto[:额外env]]
 run_all() {
@@ -185,7 +234,7 @@ run_all() {
             done
             [ "$want" -eq 0 ] && continue
         fi
-        run_case "$name" "$file" "$script" "$mode" "$extra"
+        run_case "$name" "${file//WORK\//$WORK/}" "$script" "$mode" "$extra"
     done <<<"$ALL_CASES"
 }
 
@@ -193,6 +242,23 @@ log "=== vimb 回归测试 ==="
 log "fixture: $FIXTURE"
 build_fixture
 run_all "$@"
+
+# CLI：vimb -w -- -foo.c 形式（-- 在选项之后）
+cli_dashdash() {
+    local bad=$1
+    local out rc=0
+    out=$(cd "$FIXTURE" && env VIMB_TEST_OUT=/dev/null VIMB_TEST_CMDS='qall!' \
+        timeout 15 "$VIMB" $bad -- code.c </dev/null 2>&1) || rc=$?
+    if echo "$out" | grep -q '用法\|usage'; then
+        log "FAIL cli_dashdash ($bad)"
+        fail=$((fail + 1))
+        failed_names="$failed_names cli_dashdash"
+    else
+        log "PASS cli_dashdash ($bad)"
+        pass=$((pass + 1))
+    fi
+}
+cli_dashdash '-w'
 
 log "=== 结果: $pass 通过, $fail 失败 ==="
 if [ "$fail" -gt 0 ]; then

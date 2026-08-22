@@ -65,8 +65,11 @@ vimb --version   # 查看版本
 ```bash
 vimb -w <文件>          # 忽略空白变更
 vimb -M -C <文件>       # 检测文件内移动 / 跨文件复制
-vimb --blame-args="-w -M -C" <文件>
 ```
+
+`--blame-args` 支持追加额外的 blame 参数；建议只使用不改变输出行范围的选项（如 `-w`/`-M`/`-C`/`--ignore-rev`），会改变行范围的选项（如 `-L`）会破坏 blame 与源窗口的行对齐。
+
+Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识别；Web 地址与 SSH 不同时，配置 `git config vimb.webBaseUrl https://gerrit.example.com` 或环境变量 `VIMB_WEB_BASE_URL`。
 
 环境变量 `VIMB_SYNC=1` 可强制使用同步 Git 调用（调试用）。
 
@@ -112,7 +115,7 @@ bash test/run.sh          # 回归测试（异步路径）
 VIMB_SYNC=1 bash test/run.sh   # 同步路径再跑一遍
 ```
 
-测试覆盖：普通文件、文件名含空格、中文文件名、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项与用户映射、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行、快捷键与 URL 构造、文件/行历史面板、blame 附加参数、视觉增强（合并显示/年龄热力/compact 状态栏）。
+测试覆盖：普通文件、文件名含空格、中文文件名、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项与用户映射、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**父版本行号偏移映射**/**新增行拦截**、快捷键与 URL 构造（含 Gerrit SSH 远端）、文件/行历史面板、历史层行历史、异步关闭竞态、blame 附加参数、视觉增强、CLI `--` 解析。
 
 ## 许可
 
