@@ -463,6 +463,7 @@ function! s:ConfigureBlameBuffer() abort
 
     augroup VimbWorkspace
         autocmd! * <buffer>
+        autocmd WinEnter <buffer> call <SID>AuxFocusWithoutSource()
         autocmd CursorMoved <buffer> call <SID>BlameCursorMoved()
         autocmd BufWipeout <buffer> call <SID>BlameGone()
     augroup END
@@ -494,6 +495,7 @@ function! s:ConfigureCommitBuffer() abort
 
     augroup VimbWorkspace
         autocmd! * <buffer>
+        autocmd WinEnter <buffer> call <SID>AuxFocusWithoutSource()
         autocmd BufWipeout <buffer> call <SID>CommitGone()
     augroup END
 endfunction
@@ -742,6 +744,20 @@ function! s:SourceGone() abort
     endtry
     let s:active = 0
     let s:file_winid = -1
+endfunction
+
+function! s:AuxFocusWithoutSource() abort
+    " 文件窗口被 :q / :wq / ZZ / <C-w>c 关闭后，焦点落入辅助面板时，
+    " 面板已失去意义，直接退出，保证一次 :q 即可离开 vimb。
+    if s:closing_blame || s:refreshing || s:FileWin()
+        return
+    endif
+    let s:closing_blame = 1
+    try
+        quit
+    finally
+        let s:closing_blame = 0
+    endtry
 endfunction
 
 function! s:MouseClick() abort
