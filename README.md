@@ -18,6 +18,14 @@
 
 ## 安装
 
+一键安装（依赖 `curl` 或 `wget`）：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
+```
+
+或手动安装：
+
 ```bash
 git clone git@github.com:weixin1263831586/Vim-Git-blame.git
 install -m 755 Vim-Git-blame/vimb ~/.local/bin/vimb
