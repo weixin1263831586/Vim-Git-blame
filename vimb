@@ -90,8 +90,8 @@ set ttimeout
 set ttimeoutlen=100
 
 highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
-highlight default VimbCurrentLine cterm=bold ctermbg=238 ctermfg=15
-            \ gui=bold guibg=#535e6b guifg=#ffffff
+highlight default VimbCurrentLine cterm=bold ctermbg=201 ctermfg=0
+            \ gui=bold guibg=#ff00ff guifg=#000000
 highlight default link VimbHash Comment
 
 let s:git_root = $VIMB_GIT_ROOT
