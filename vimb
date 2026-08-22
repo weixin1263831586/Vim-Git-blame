@@ -1,0 +1,794 @@
+#!/usr/bin/env bash
+# vimb - a small, predictable Vim Git blame workspace.
+
+set -euo pipefail
+
+VERSION="2.0.0"
+
+usage() {
+    cat <<'EOF'
+用法: vimb [--] <文件>
+
+在 Vim 中打开一个已被 Git 跟踪的文件，并在左侧显示逐行 blame 信息。
+
+  鼠标单击 / Enter   查看该行所属 commit
+  q / Backspace       从 commit 返回原文件
+  q                   在 blame 栏关闭 blame
+  gb                  显示或隐藏 blame
+  r / F5              刷新 blame
+  ?                    显示快捷键提示
+
+辅助面板都是只读临时缓冲区；vimb 只会打开命令行指定的文件。
+文件名以 “-” 开头时，请使用: vimb -- <文件>
+EOF
+}
+
+die() {
+    printf 'vimb: %s\n' "$*" >&2
+    exit 1
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --version)
+        printf 'vimb %s\n' "$VERSION"
+        exit 0
+        ;;
+esac
+
+if [ "${1:-}" = "--" ]; then
+    shift
+fi
+
+[ "$#" -eq 1 ] || {
+    usage >&2
+    exit 2
+}
+
+INPUT_FILE=$1
+if ! FILE=$(realpath -- "$INPUT_FILE" 2>/dev/null); then
+    die "文件不存在: $INPUT_FILE"
+fi
+[ -f "$FILE" ] || die "不是普通文件: $INPUT_FILE"
+
+FILE_DIR=$(dirname -- "$FILE")
+if ! GIT_ROOT=$(git -C "$FILE_DIR" rev-parse --show-toplevel 2>/dev/null); then
+    die "文件不在 Git 工作区中: $FILE"
+fi
+GIT_ROOT=$(realpath -- "$GIT_ROOT")
+REL_PATH=$(realpath --relative-to="$GIT_ROOT" -- "$FILE")
+
+case "$REL_PATH" in
+    ..|../*) die "文件不属于检测到的 Git 工作区: $FILE" ;;
+esac
+
+if ! git -C "$GIT_ROOT" ls-files --error-unmatch -- "$REL_PATH" >/dev/null 2>&1; then
+    die "文件尚未被 Git 跟踪: $REL_PATH"
+fi
+
+command -v vim >/dev/null 2>&1 || die "未找到 vim"
+
+VIM_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/vimb.XXXXXX.vim")
+trap 'rm -f -- "$VIM_SCRIPT"' EXIT
+
+cat >"$VIM_SCRIPT" <<'VIMSCRIPT'
+" vimb internal Vim script. All auxiliary buffers are buftype=nofile.
+scriptencoding utf-8
+
+if &compatible
+    set nocompatible
+endif
+
+set mouse=a
+if exists('+ttymouse')
+    set ttymouse=sgr
+endif
+set ttimeout
+set ttimeoutlen=100
+
+highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
+highlight default link VimbHash Comment
+
+let s:sid = expand('<SID>')
+let s:git_root = $VIMB_GIT_ROOT
+let s:rel_path = $VIMB_REL_PATH
+let s:file_path = $VIMB_FILE
+let s:file_bufnr = bufnr('%')
+let s:file_winid = win_getid()
+let s:blame_bufnr = -1
+let s:blame_winid = -1
+let s:commit_bufnr = -1
+let s:commit_winid = -1
+let s:active = 0
+let s:syncing = 0
+let s:refreshing = 0
+let s:closing_blame = 0
+let s:closing_commit = 0
+let s:file_options = {}
+let s:file_maps = {}
+let s:return_view = {}
+let s:pending_records = []
+
+function! s:Error(message) abort
+    echohl ErrorMsg
+    echomsg 'vimb: ' . a:message
+    echohl None
+endfunction
+
+function! s:Info(message) abort
+    echohl ModeMsg
+    echo 'vimb: ' . a:message
+    echohl None
+endfunction
+
+function! s:WindowMatches(winid, bufnr) abort
+    if a:winid <= 0
+        return 0
+    endif
+    let l:info = getwininfo(a:winid)
+    return len(l:info) == 1
+                \ && l:info[0].tabnr == tabpagenr()
+                \ && (a:bufnr <= 0 || l:info[0].bufnr == a:bufnr)
+endfunction
+
+function! s:WindowForBuffer(preferred, bufnr) abort
+    if s:WindowMatches(a:preferred, a:bufnr)
+        return a:preferred
+    endif
+    for l:info in getwininfo()
+        if l:info.tabnr == tabpagenr() && l:info.bufnr == a:bufnr
+            return l:info.winid
+        endif
+    endfor
+    return 0
+endfunction
+
+function! s:FileWin() abort
+    let s:file_winid = s:WindowForBuffer(s:file_winid, s:file_bufnr)
+    return s:file_winid
+endfunction
+
+function! s:BlameWin() abort
+    let s:blame_winid = s:WindowForBuffer(s:blame_winid, s:blame_bufnr)
+    return s:blame_winid
+endfunction
+
+function! s:CommitWin() abort
+    let s:commit_winid = s:WindowForBuffer(s:commit_winid, s:commit_bufnr)
+    return s:commit_winid
+endfunction
+
+function! s:CaptureView(winid) abort
+    let s:captured_view = {}
+    if s:WindowMatches(a:winid, -1)
+        call win_execute(a:winid, 'let s:captured_view = winsaveview()')
+    endif
+    return copy(s:captured_view)
+endfunction
+
+function! s:RestoreView(winid, view) abort
+    if !empty(a:view) && s:WindowMatches(a:winid, -1)
+        call win_execute(a:winid, 'call winrestview(' . string(a:view) . ')')
+    endif
+endfunction
+
+function! s:GitFailure(lines) abort
+    let l:text = substitute(join(a:lines, ' '), '\s\+', ' ', 'g')
+    return empty(l:text) ? 'Git 命令执行失败' : strpart(l:text, 0, 240)
+endfunction
+
+function! s:ReadBlame() abort
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' blame --no-ext-diff --no-textconv --line-porcelain -- '
+                \ . shellescape(s:rel_path) . ' 2>&1'
+    let l:output = systemlist(l:cmd)
+    if v:shell_error
+        return {'ok': 0, 'error': s:GitFailure(l:output), 'records': []}
+    endif
+
+    let l:records = []
+    let l:record = {}
+    for l:raw in l:output
+        let l:header = matchlist(l:raw,
+                    \ '^\([0-9a-f]\{40,64}\) \(\d\+\) \(\d\+\)\%(\s\+\d\+\)\?$')
+        if !empty(l:header)
+            let l:record = {
+                        \ 'hash': l:header[1],
+                        \ 'original_line': str2nr(l:header[2]),
+                        \ 'final_line': str2nr(l:header[3]),
+                        \ 'author': '',
+                        \ 'author_time': 0,
+                        \ 'summary': ''}
+        elseif empty(l:record)
+            continue
+        elseif stridx(l:raw, 'author ') == 0
+            let l:record.author = strpart(l:raw, 7)
+        elseif stridx(l:raw, 'author-time ') == 0
+            let l:record.author_time = str2nr(strpart(l:raw, 12))
+        elseif stridx(l:raw, 'summary ') == 0
+            let l:record.summary = strpart(l:raw, 8)
+        elseif stridx(l:raw, "\t") == 0
+            let l:record.text = strpart(l:raw, 1)
+            call add(l:records, l:record)
+            let l:record = {}
+        endif
+    endfor
+
+    if !empty(l:output) && empty(l:records)
+        return {'ok': 0, 'error': '无法解析 git blame 输出', 'records': []}
+    endif
+    return {'ok': 1, 'error': '', 'records': l:records}
+endfunction
+
+function! s:ReadCommit(hash) abort
+    if a:hash !~# '^\x\{40,64}$' || a:hash =~# '^0\+$'
+        return {'ok': 0, 'error': '该行还没有 commit', 'lines': []}
+    endif
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' show --no-color --no-ext-diff --no-textconv'
+                \ . ' --format=fuller --decorate=no --stat --patch '
+                \ . shellescape(a:hash) . ' -- 2>&1'
+    let l:output = systemlist(l:cmd)
+    if v:shell_error
+        return {'ok': 0, 'error': s:GitFailure(l:output), 'lines': []}
+    endif
+    return {'ok': 1, 'error': '', 'lines': l:output}
+endfunction
+
+function! s:ClipAndPad(text, width) abort
+    let l:text = substitute(a:text, '\s\+', ' ', 'g')
+    if strdisplaywidth(l:text) <= a:width
+        return l:text . repeat(' ', a:width - strdisplaywidth(l:text))
+    endif
+    let l:result = ''
+    for l:char in split(l:text, '\zs')
+        if strdisplaywidth(l:result . l:char . '…') > a:width
+            break
+        endif
+        let l:result .= l:char
+    endfor
+    let l:result .= '…'
+    return l:result . repeat(' ', max([0, a:width - strdisplaywidth(l:result)]))
+endfunction
+
+function! s:BlameDisplayLines(records) abort
+    if empty(a:records)
+        return ['(空文件：没有可显示的 blame 信息)']
+    endif
+    let l:number_width = max([4, strlen(string(len(a:records)))])
+    let l:lines = []
+    for l:record in a:records
+        let l:hash = l:record.hash =~# '^0\+$'
+                    \ ? 'WORKTREE'
+                    \ : strpart(l:record.hash, 0, 10)
+        let l:date = get(l:record, 'author_time', 0) > 0
+                    \ ? strftime('%Y-%m-%d', l:record.author_time)
+                    \ : '----------'
+        let l:author = s:ClipAndPad(get(l:record, 'author', '?'), 12)
+        call add(l:lines, printf('%-10s %s %s %*d',
+                    \ l:hash, l:author, l:date, l:number_width,
+                    \ get(l:record, 'final_line', len(l:lines) + 1)))
+    endfor
+    return l:lines
+endfunction
+
+function! s:ReplaceCurrentBuffer(lines) abort
+    setlocal modifiable
+    silent %delete _
+    call setline(1, empty(a:lines) ? [''] : a:lines)
+    setlocal nomodifiable
+    setlocal nomodified
+endfunction
+
+function! s:PopulateBlame(records) abort
+    let b:vimb_records = deepcopy(a:records)
+    call s:ReplaceCurrentBuffer(s:BlameDisplayLines(a:records))
+endfunction
+
+function! s:PopulatePendingBlame() abort
+    call s:PopulateBlame(s:pending_records)
+endfunction
+
+function! s:ResizeBlame() abort
+    let l:max_width = 24
+    for l:text in getline(1, '$')
+        let l:max_width = max([l:max_width, strdisplaywidth(l:text) + 1])
+    endfor
+    let l:limit = min([64, max([20, &columns / 2])])
+    setlocal nowinfixwidth
+    execute 'vertical resize ' . min([l:max_width, l:limit])
+    setlocal winfixwidth
+endfunction
+
+function! s:CurrentRecord() abort
+    if !exists('b:vimb_records')
+        return {}
+    endif
+    return get(b:vimb_records, line('.') - 1, {})
+endfunction
+
+function! s:HighlightCommit() abort
+    if exists('w:vimb_same_match') && w:vimb_same_match > 0
+        silent! call matchdelete(w:vimb_same_match)
+    endif
+    let w:vimb_same_match = -1
+    let l:record = s:CurrentRecord()
+    if empty(l:record)
+        return
+    endif
+    let l:positions = []
+    for l:index in range(0, len(b:vimb_records) - 1)
+        if b:vimb_records[l:index].hash ==# l:record.hash
+            call add(l:positions, [l:index + 1])
+        endif
+    endfor
+    if !empty(l:positions)
+        let w:vimb_same_match = matchaddpos('VimbSameCommit', l:positions, 10)
+    endif
+endfunction
+
+function! s:FileLine() abort
+    let l:fw = s:FileWin()
+    if !l:fw
+        return 1
+    endif
+    let s:captured_line = 1
+    call win_execute(l:fw, 'let s:captured_line = line(".")')
+    return s:captured_line
+endfunction
+
+function! s:FileCursorMoved() abort
+    if s:syncing || s:refreshing || win_getid() != s:FileWin()
+        return
+    endif
+    let l:bw = s:BlameWin()
+    if !l:bw
+        return
+    endif
+    let s:syncing = 1
+    try
+        let l:target = line('.')
+        call win_execute(l:bw,
+                    \ 'call cursor(min([' . l:target . ', line("$")]), 1)')
+        call win_execute(l:bw, 'call ' . s:sid . 'HighlightCommit()')
+        if s:CommitWin()
+            let s:return_view = winsaveview()
+        endif
+    finally
+        let s:syncing = 0
+    endtry
+endfunction
+
+function! s:BlameCursorMoved() abort
+    if s:syncing || s:refreshing || win_getid() != s:BlameWin()
+        return
+    endif
+    let l:fw = s:FileWin()
+    if !l:fw
+        return
+    endif
+    let s:syncing = 1
+    try
+        let l:target = line('.')
+        call win_execute(l:fw, 'call cursor(' . l:target . ', col("."))')
+        call s:HighlightCommit()
+    finally
+        let s:syncing = 0
+    endtry
+endfunction
+
+function! s:SaveFileMap(lhs) abort
+    let l:mapping = maparg(a:lhs, 'n', 0, 1)
+    let s:file_maps[a:lhs] = !empty(l:mapping) && get(l:mapping, 'buffer', 0)
+                \ ? l:mapping : {}
+endfunction
+
+function! s:InstallActiveFileMaps() abort
+    let s:file_maps = {}
+    call s:SaveFileMap('<F5>')
+    nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
+endfunction
+
+function! s:RestoreActiveFileMapsHere() abort
+    for l:lhs in ['<F5>']
+        execute 'silent! nunmap <buffer> ' . l:lhs
+        let l:mapping = get(s:file_maps, l:lhs, {})
+        if !empty(l:mapping)
+            call mapset('n', 0, l:mapping)
+        endif
+    endfor
+    let s:file_maps = {}
+endfunction
+
+function! s:ActivateFile() abort
+    let s:file_options = {'wrap': &l:wrap, 'scrollbind': &l:scrollbind}
+    setlocal nowrap
+    setlocal noscrollbind
+    call s:InstallActiveFileMaps()
+    augroup VimbWorkspace
+        autocmd! * <buffer>
+        autocmd CursorMoved <buffer> call <SID>FileCursorMoved()
+        autocmd BufWritePost <buffer> call <SID>Refresh(0)
+        autocmd BufWipeout <buffer> call <SID>SourceGone()
+    augroup END
+endfunction
+
+function! s:DeactivateFile() abort
+    let l:fw = s:FileWin()
+    execute 'autocmd! VimbWorkspace * <buffer=' . s:file_bufnr . '>'
+    if l:fw
+        let l:wrap = get(s:file_options, 'wrap', 0)
+        let l:scrollbind = get(s:file_options, 'scrollbind', 0)
+        call win_execute(l:fw, 'let &l:wrap = ' . l:wrap
+                    \ . ' | let &l:scrollbind = ' . l:scrollbind)
+        call win_execute(l:fw, 'call ' . s:sid . 'RestoreActiveFileMapsHere()')
+    endif
+    let s:file_options = {}
+endfunction
+
+function! s:ConfigureBlameBuffer() abort
+    setlocal buftype=nofile
+    setlocal bufhidden=wipe
+    setlocal nobuflisted
+    setlocal noswapfile
+    setlocal nomodeline
+    setlocal nowrap
+    setlocal nonumber norelativenumber
+    setlocal cursorline
+    setlocal foldcolumn=0
+    setlocal nofoldenable
+    setlocal nospell
+    setlocal undolevels=-1
+    setlocal noscrollbind
+    let &l:statusline = ' vimb blame  |  click/Enter: commit  |  q: close '
+    silent execute 'file ' . fnameescape('[vimb-blame]')
+
+    " Open on release. The normal press has already selected the exact row,
+    " and the complete terminal mouse sequence is consumed before relayout.
+    nnoremap <buffer> <silent> <LeftRelease> :call <SID>MouseClick()<CR>
+    nnoremap <buffer> <silent> <CR> :call <SID>ShowCommit()<CR>
+    nnoremap <buffer> <silent> r :call <SID>Refresh(1)<CR>
+    nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
+    nnoremap <buffer> <silent> q :call <SID>CloseBlame()<CR>
+    nnoremap <buffer> <silent> <C-c> :call <SID>CloseBlame()<CR>
+    nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
+    nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+
+    augroup VimbWorkspace
+        autocmd! * <buffer>
+        autocmd CursorMoved <buffer> call <SID>BlameCursorMoved()
+        autocmd BufWipeout <buffer> call <SID>BlameGone()
+    augroup END
+endfunction
+
+function! s:ConfigureCommitBuffer() abort
+    setlocal buftype=nofile
+    setlocal bufhidden=wipe
+    setlocal nobuflisted
+    setlocal noswapfile
+    setlocal nomodeline
+    setlocal nowrap
+    setlocal nonumber norelativenumber
+    setlocal foldcolumn=0
+    setlocal nofoldenable
+    setlocal nospell
+    setlocal undolevels=-1
+    setlocal noscrollbind
+    setlocal filetype=diff
+    let &l:statusline = ' vimb commit  |  q/Backspace/Ctrl-O: return to source '
+    silent execute 'file ' . fnameescape('[vimb-commit]')
+
+    nnoremap <buffer> <silent> q :call <SID>CloseCommit(1)<CR>
+    nnoremap <buffer> <silent> <C-c> :call <SID>CloseCommit(1)<CR>
+    nnoremap <buffer> <silent> <BS> :call <SID>CloseCommit(1)<CR>
+    nnoremap <buffer> <silent> <C-o> :call <SID>CloseCommit(1)<CR>
+    nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
+    nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+
+    augroup VimbWorkspace
+        autocmd! * <buffer>
+        autocmd BufWipeout <buffer> call <SID>CommitGone()
+    augroup END
+endfunction
+
+function! s:OpenBlame() abort
+    if s:active && s:BlameWin()
+        return
+    endif
+    let l:fw = s:FileWin()
+    if !l:fw
+        call s:Error('原文件窗口已经不存在，拒绝打开 blame')
+        return
+    endif
+    call win_gotoid(l:fw)
+
+    let l:data = s:ReadBlame()
+    if !l:data.ok
+        call s:Error(l:data.error)
+        return
+    endif
+
+    let l:file_view = winsaveview()
+    try
+        call s:ActivateFile()
+        noautocmd leftabove vnew
+        let s:blame_winid = win_getid()
+        let s:blame_bufnr = bufnr('%')
+        let s:active = 1
+        call s:ConfigureBlameBuffer()
+        call s:PopulateBlame(l:data.records)
+        call s:ResizeBlame()
+
+        let l:target = min([get(l:file_view, 'lnum', 1), line('$')])
+        let l:blame_view = winsaveview()
+        let l:blame_view.lnum = l:target
+        let l:blame_view.col = 1
+        let l:blame_view.topline = min([get(l:file_view, 'topline', 1), line('$')])
+        let l:blame_view.leftcol = 0
+        call winrestview(l:blame_view)
+        let w:vimb_hash_match = matchadd('VimbHash', '^\S\+', 20)
+        call s:HighlightCommit()
+
+        setlocal scrollbind
+        call win_execute(l:fw, 'setlocal scrollbind')
+        call win_gotoid(l:fw)
+        call winrestview(l:file_view)
+        syncbind
+    catch
+        let l:failure = v:exception
+        call s:CloseBlame()
+        call s:Error(l:failure)
+    endtry
+endfunction
+
+function! s:Refresh(notify) abort
+    let l:bw = s:BlameWin()
+    let l:fw = s:FileWin()
+    if !l:bw || !l:fw
+        if a:notify
+            call s:Error('blame 当前未打开')
+        endif
+        return
+    endif
+    let l:data = s:ReadBlame()
+    if !l:data.ok
+        call s:Error(l:data.error)
+        return
+    endif
+
+    let s:refreshing = 1
+    try
+        let l:line = s:FileLine()
+        let s:pending_records = l:data.records
+        call win_execute(l:bw, 'call ' . s:sid . 'PopulatePendingBlame()')
+        call win_execute(l:bw,
+                    \ 'call cursor(min([' . l:line . ', line("$")]), 1)')
+        call win_execute(l:bw, 'call ' . s:sid . 'ResizeBlame()')
+        call win_execute(l:bw, 'call ' . s:sid . 'HighlightCommit()')
+        call win_execute(l:fw, 'syncbind')
+    finally
+        let s:pending_records = []
+        let s:refreshing = 0
+    endtry
+    if a:notify
+        call s:Info('blame 已刷新')
+    endif
+endfunction
+
+function! s:ShowCommit() abort
+    if win_getid() != s:BlameWin()
+        return
+    endif
+    let l:record = s:CurrentRecord()
+    if empty(l:record)
+        call s:Error('当前行没有 blame 信息')
+        return
+    endif
+    if l:record.hash =~# '^0\+$'
+        call s:Error('这是尚未提交的工作区内容，没有可显示的 commit')
+        return
+    endif
+
+    let l:data = s:ReadCommit(l:record.hash)
+    if !l:data.ok
+        call s:Error(l:data.error)
+        return
+    endif
+
+    let l:fw = s:FileWin()
+    let l:bw = s:BlameWin()
+    if !l:fw || !l:bw
+        call s:Error('vimb 窗口状态已失效')
+        return
+    endif
+    let s:return_view = s:CaptureView(l:fw)
+    let l:file_view = copy(s:return_view)
+    let l:blame_view = s:CaptureView(l:bw)
+    let l:cw = s:CommitWin()
+
+    if !l:cw
+        noautocmd botright new
+        let s:commit_winid = win_getid()
+        let s:commit_bufnr = bufnr('%')
+        call s:ConfigureCommitBuffer()
+        execute 'resize ' . max([8, &lines * 2 / 5])
+        setlocal winfixheight
+        call s:RestoreView(l:fw, l:file_view)
+        call s:RestoreView(l:bw, l:blame_view)
+    else
+        call win_gotoid(l:cw)
+    endif
+
+    let l:title = 'vimb commit ' . l:record.hash
+                \ . '    q/Backspace/Ctrl-O: 返回 ' . fnamemodify(s:file_path, ':t')
+    call s:ReplaceCurrentBuffer([l:title, repeat('-', min([100, max([40, &columns - 1])])), '']
+                \ + l:data.lines)
+    let b:vimb_hash = l:record.hash
+    normal! gg
+    call s:Info(strpart(l:record.hash, 0, 12) . '  ' . get(l:record, 'summary', ''))
+endfunction
+
+function! s:CloseAuxWindow(winid) abort
+    if !s:WindowMatches(a:winid, -1)
+        return
+    endif
+    if win_getid() == a:winid
+        silent! close!
+    else
+        call win_execute(a:winid, 'silent! close!')
+    endif
+endfunction
+
+function! s:ReturnToFile() abort
+    let l:fw = s:FileWin()
+    if !l:fw
+        call s:Error('原文件窗口已经不存在')
+        return
+    endif
+    call win_gotoid(l:fw)
+    if !empty(s:return_view)
+        call winrestview(s:return_view)
+    endif
+    if s:BlameWin()
+        syncbind
+    endif
+endfunction
+
+function! s:CloseCommit(return_to_file) abort
+    let l:cw = s:CommitWin()
+    if l:cw
+        let s:closing_commit = 1
+        try
+            call s:CloseAuxWindow(l:cw)
+        finally
+            let s:closing_commit = 0
+        endtry
+    endif
+    let s:commit_winid = -1
+    let s:commit_bufnr = -1
+    if a:return_to_file
+        call s:ReturnToFile()
+    endif
+endfunction
+
+function! s:CommitGone() abort
+    let s:commit_winid = -1
+    let s:commit_bufnr = -1
+    if !s:closing_commit && !s:closing_blame
+        call s:ReturnToFile()
+    endif
+endfunction
+
+function! s:CloseBlame() abort
+    let l:fw = s:FileWin()
+    let l:file_view = l:fw ? s:CaptureView(l:fw) : {}
+    let s:closing_blame = 1
+    try
+        call s:CloseCommit(0)
+        let l:bw = s:BlameWin()
+        if l:bw
+            call s:CloseAuxWindow(l:bw)
+        endif
+        let s:blame_winid = -1
+        let s:blame_bufnr = -1
+        let s:active = 0
+        call s:DeactivateFile()
+    finally
+        let s:closing_blame = 0
+    endtry
+    if l:fw && s:WindowMatches(l:fw, s:file_bufnr)
+        call win_gotoid(l:fw)
+        call winrestview(l:file_view)
+    endif
+    echo ''
+endfunction
+
+function! s:BlameGone() abort
+    let s:blame_winid = -1
+    let s:blame_bufnr = -1
+    let s:active = 0
+    if s:closing_blame
+        return
+    endif
+    let l:fw = s:FileWin()
+    let l:view = l:fw ? s:CaptureView(l:fw) : {}
+    let s:closing_blame = 1
+    try
+        call s:CloseCommit(0)
+        call s:DeactivateFile()
+    finally
+        let s:closing_blame = 0
+    endtry
+    if l:fw
+        call win_gotoid(l:fw)
+        call winrestview(l:view)
+    endif
+endfunction
+
+function! s:SourceGone() abort
+    let s:closing_blame = 1
+    try
+        call s:CloseCommit(0)
+        call s:CloseAuxWindow(s:BlameWin())
+    finally
+        let s:closing_blame = 0
+    endtry
+    let s:active = 0
+    let s:file_winid = -1
+endfunction
+
+function! s:MouseClick() abort
+    if exists('*getmousepos')
+        let l:mouse = getmousepos()
+        if get(l:mouse, 'winid', 0) == s:BlameWin() && get(l:mouse, 'line', 0) > 0
+            call cursor(l:mouse.line, 1)
+            call s:BlameCursorMoved()
+            call s:ShowCommit()
+        endif
+    elseif win_getid() == s:BlameWin()
+        call s:BlameCursorMoved()
+        call s:ShowCommit()
+    endif
+endfunction
+
+function! s:Toggle() abort
+    if s:active || s:BlameWin()
+        call s:CloseBlame()
+    else
+        call s:OpenBlame()
+    endif
+endfunction
+
+function! s:Help() abort
+    if s:CommitWin()
+        call s:Info('commit: q/Backspace/Ctrl-O 返回原文件；gb 关闭全部辅助面板')
+    elseif win_getid() == s:BlameWin()
+        call s:Info('blame: 单击/Enter 查看 commit；r 刷新；q 关闭')
+    else
+        call s:Info('文件: gb 显示/隐藏 blame；blame 打开时 F5 刷新')
+    endif
+endfunction
+
+command! -bar VimbToggle call <SID>Toggle()
+command! -bar VimbRefresh call <SID>Refresh(1)
+command! -bar VimbBack call <SID>CloseCommit(1)
+command! -bar VimbHelp call <SID>Help()
+
+if resolve(expand('%:p')) !=# resolve(s:file_path)
+    call s:Error('启动文件与请求文件不一致，已中止 blame 初始化')
+else
+    setlocal number
+    nnoremap <buffer> <silent> gb :call <SID>Toggle()<CR>
+    nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+    call s:OpenBlame()
+endif
+VIMSCRIPT
+
+export VIMB_GIT_ROOT="$GIT_ROOT"
+export VIMB_REL_PATH="$REL_PATH"
+export VIMB_FILE="$FILE"
+
+vim -N -S "$VIM_SCRIPT" -- "$FILE"
