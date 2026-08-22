@@ -12,6 +12,7 @@ usage() {
 在 Vim 中打开一个已被 Git 跟踪的文件，并在左侧显示逐行 blame 信息。
 
   鼠标单击 / Enter   查看该行所属 commit
+  f                  commit 面板内切换 仅此文件/全部文件
   q / Backspace       从 commit 返回原文件
   q                   在 blame 栏关闭 blame
   gb                  显示或隐藏 blame
@@ -224,15 +225,18 @@ function! s:ReadBlame() abort
     return {'ok': 1, 'error': '', 'records': l:records}
 endfunction
 
-function! s:ReadCommit(hash) abort
+function! s:ReadCommit(hash, file_only) abort
     if a:hash !~# '^\x\{40,64}$' || a:hash =~# '^0\+$'
         return {'ok': 0, 'error': '该行还没有 commit', 'lines': []}
     endif
     let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
                 \ . ' show --no-color --no-ext-diff --no-textconv'
                 \ . ' --format=fuller --decorate=no --stat --patch '
-                \ . shellescape(a:hash) . ' -- 2>&1'
-    let l:output = systemlist(l:cmd)
+                \ . shellescape(a:hash) . ' --'
+    if a:file_only
+        let l:cmd .= ' ' . shellescape(s:rel_path)
+    endif
+    let l:output = systemlist(l:cmd . ' 2>&1')
     if v:shell_error
         return {'ok': 0, 'error': s:GitFailure(l:output), 'lines': []}
     endif
@@ -394,10 +398,12 @@ function! s:InstallActiveFileMaps() abort
     let s:file_maps = {}
     call s:SaveFileMap('<F5>')
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
+    call s:SaveFileMap('<CR>')
+    nnoremap <buffer> <silent> <CR> :call <SID>ShowCommitAtFileLine()<CR>
 endfunction
 
 function! s:RestoreActiveFileMapsHere() abort
-    for l:lhs in ['<F5>']
+    for l:lhs in ['<F5>', '<CR>']
         execute 'silent! nunmap <buffer> ' . l:lhs
         let l:mapping = get(s:file_maps, l:lhs, {})
         if !empty(l:mapping)
@@ -483,13 +489,14 @@ function! s:ConfigureCommitBuffer() abort
     setlocal undolevels=-1
     setlocal noscrollbind
     setlocal filetype=diff
-    let &l:statusline = ' vimb commit  |  q/Backspace/Ctrl-O: return to source '
+    let &l:statusline = ' vimb commit  |  f: 仅此文件/全部文件  |  q/Backspace/Ctrl-O: return to source '
     silent execute 'file ' . fnameescape('[vimb-commit]')
 
     nnoremap <buffer> <silent> q :call <SID>CloseCommit(1)<CR>
     nnoremap <buffer> <silent> <C-c> :call <SID>CloseCommit(1)<CR>
     nnoremap <buffer> <silent> <BS> :call <SID>CloseCommit(1)<CR>
     nnoremap <buffer> <silent> <C-o> :call <SID>CloseCommit(1)<CR>
+    nnoremap <buffer> <silent> f :call <SID>ToggleCommitScope()<CR>
     nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
 
@@ -584,23 +591,27 @@ function! s:Refresh(notify) abort
     endif
 endfunction
 
-function! s:ShowCommit() abort
-    if win_getid() != s:BlameWin()
-        return
-    endif
-    let l:record = s:CurrentRecord()
-    if empty(l:record)
-        call s:Error('当前行没有 blame 信息')
-        return
-    endif
-    if l:record.hash =~# '^0\+$'
-        call s:Error('这是尚未提交的工作区内容，没有可显示的 commit')
-        return
-    endif
-
-    let l:data = s:ReadCommit(l:record.hash)
+function! s:RenderCommit(record, file_only) abort
+    let l:data = s:ReadCommit(a:record.hash, a:file_only)
     if !l:data.ok
         call s:Error(l:data.error)
+        return 0
+    endif
+    let l:scope = a:file_only ? '仅此文件' : '全部文件'
+    let l:title = 'vimb commit ' . a:record.hash . '  [' . l:scope . ']'
+                \ . '  f: 切换范围  q/Backspace/Ctrl-O: 返回 '
+                \ . fnamemodify(s:file_path, ':t')
+    call s:ReplaceCurrentBuffer([l:title, repeat('-', min([100, max([40, &columns - 1])])), '']
+                \ + l:data.lines)
+    let b:vimb_hash = a:record.hash
+    let b:vimb_file_only = a:file_only
+    normal! gg
+    return 1
+endfunction
+
+function! s:OpenCommitForRecord(record) abort
+    if a:record.hash =~# '^0\+$'
+        call s:Error('这是尚未提交的工作区内容，没有可显示的 commit')
         return
     endif
 
@@ -628,13 +639,51 @@ function! s:ShowCommit() abort
         call win_gotoid(l:cw)
     endif
 
-    let l:title = 'vimb commit ' . l:record.hash
-                \ . '    q/Backspace/Ctrl-O: 返回 ' . fnamemodify(s:file_path, ':t')
-    call s:ReplaceCurrentBuffer([l:title, repeat('-', min([100, max([40, &columns - 1])])), '']
-                \ + l:data.lines)
-    let b:vimb_hash = l:record.hash
-    normal! gg
-    call s:Info(strpart(l:record.hash, 0, 12) . '  ' . get(l:record, 'summary', ''))
+    " 同一个 commit 重复打开时保留已选的查看范围，新 commit 默认只看当前文件
+    let l:file_only = (get(b:, 'vimb_hash', '') ==# a:record.hash)
+                \ ? get(b:, 'vimb_file_only', 1) : 1
+    if s:RenderCommit(a:record, l:file_only)
+        call s:Info(strpart(a:record.hash, 0, 12) . '  '
+                    \ . get(a:record, 'summary', ''))
+    endif
+endfunction
+
+function! s:ShowCommit() abort
+    if win_getid() != s:BlameWin()
+        return
+    endif
+    let l:record = s:CurrentRecord()
+    if empty(l:record)
+        call s:Error('当前行没有 blame 信息')
+        return
+    endif
+    call s:OpenCommitForRecord(l:record)
+endfunction
+
+function! s:ShowCommitAtFileLine() abort
+    if win_getid() != s:FileWin()
+        return
+    endif
+    if !s:BlameWin()
+        call s:OpenBlame()
+        if !s:BlameWin()
+            return
+        endif
+    endif
+    let l:records = getbufvar(s:blame_bufnr, 'vimb_records', [])
+    let l:record = get(l:records, line('.') - 1, {})
+    if empty(l:record)
+        call s:Error('当前行没有 blame 信息')
+        return
+    endif
+    call s:OpenCommitForRecord(l:record)
+endfunction
+
+function! s:ToggleCommitScope() abort
+    if win_getid() != s:CommitWin() || !exists('b:vimb_hash')
+        return
+    endif
+    call s:RenderCommit({'hash': b:vimb_hash}, !get(b:, 'vimb_file_only', 1))
 endfunction
 
 function! s:CloseAuxWindow(winid) abort
@@ -784,11 +833,11 @@ endfunction
 
 function! s:Help() abort
     if s:CommitWin()
-        call s:Info('commit: q/Backspace/Ctrl-O 返回原文件；gb 关闭全部辅助面板')
+        call s:Info('commit: f 切换仅此文件/全部文件；q/Backspace/Ctrl-O 返回原文件；gb 关闭全部辅助面板')
     elseif win_getid() == s:BlameWin()
         call s:Info('blame: 单击/Enter 查看 commit；r 刷新；q 关闭')
     else
-        call s:Info('文件: gb 显示/隐藏 blame；blame 打开时 F5 刷新')
+        call s:Info('文件: Enter 查看当前行 commit；gb 显示/隐藏 blame；blame 打开时 F5 刷新')
     endif
 endfunction
 
