@@ -3,15 +3,23 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 usage() {
     cat <<'EOF'
-用法: vimb [--] <文件>
+用法: vimb [-w] [-M] [-C] [--blame-args="<选项>"] [--] <文件>
 
 在 Vim 中打开一个已被 Git 跟踪的文件，并在左侧显示逐行 blame 信息。
 
+  -w / -M / -C        追加给 git blame 的选项：忽略空白 / 检测文件内移动 / 检测跨文件复制
+  --blame-args=...    透传任意 git blame 选项，如 --blame-args="-w -M -C"
+
   鼠标单击 / Enter   查看该行所属 commit
+  Tab / Backspace    向前追溯该行的历史 commit / 返回较新版本
+  gh / gl            文件历史 / 当前行历史
+  i                  轻量 commit 信息（作者/日期/previous）
+  y                  复制当前 commit SHA
+  o                  在浏览器打开 commit（GitHub/GitLab/Gerrit 等）
   f                  commit 面板内切换 仅此文件/全部文件
   q / Backspace       从 commit 返回原文件
   q                   在 blame 栏关闭 blame
@@ -44,23 +52,78 @@ if [ "${1:-}" = "--" ]; then
     shift
 fi
 
+# blame 附加选项：-w / -M / -C / --blame-args
+BLAME_EXTRA_ARGS=''
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -w|-M|-C)
+            BLAME_EXTRA_ARGS="$BLAME_EXTRA_ARGS $1"
+            shift
+            ;;
+        --blame-args)
+            [ "$#" -ge 2 ] || die "--blame-args 需要参数"
+            BLAME_EXTRA_ARGS="$BLAME_EXTRA_ARGS $2"
+            shift 2
+            ;;
+        --blame-args=*)
+            BLAME_EXTRA_ARGS="$BLAME_EXTRA_ARGS ${1#--blame-args=}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 [ "$#" -eq 1 ] || {
     usage >&2
     exit 2
 }
 
 INPUT_FILE=$1
-if ! FILE=$(realpath -- "$INPUT_FILE" 2>/dev/null); then
-    die "文件不存在: $INPUT_FILE"
-fi
-[ -f "$FILE" ] || die "不是普通文件: $INPUT_FILE"
+
+# 尽力解析为绝对路径（不依赖 GNU realpath --relative-to）：
+# readlink -f（Linux / macOS 12.3+）→ realpath → 纯 bash 词法归一化（不解析符号链接）
+resolve_path() {
+    local p=$1 out
+    if out=$(readlink -f -- "$p" 2>/dev/null) && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if out=$(realpath -- "$p" 2>/dev/null) && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    local -a parts=()
+    local part norm=/
+    case "$p" in
+        /*) IFS=/ read -ra parts <<<"$p" ;;
+        *)  IFS=/ read -ra parts <<<"$PWD/$p" ;;
+    esac
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|.) ;;
+            ..)
+                norm=${norm%/}
+                norm=${norm%/*}
+                [ -z "$norm" ] && norm=/
+                ;;
+            *) norm="$norm$part/" ;;
+        esac
+    done
+    printf '%s\n' "${norm%/}"
+}
+
+FILE=$(resolve_path "$INPUT_FILE")
+[ -f "$FILE" ] || die "文件不存在: $INPUT_FILE"
 
 FILE_DIR=$(dirname -- "$FILE")
 if ! GIT_ROOT=$(git -C "$FILE_DIR" rev-parse --show-toplevel 2>/dev/null); then
     die "文件不在 Git 工作区中: $FILE"
 fi
-GIT_ROOT=$(realpath -- "$GIT_ROOT")
-REL_PATH=$(realpath --relative-to="$GIT_ROOT" -- "$FILE")
+GIT_ROOT=$(resolve_path "$GIT_ROOT")
+REL_PATH=${FILE#"$GIT_ROOT"/}
+[ "$REL_PATH" != "$FILE" ] || die "文件不属于检测到的 Git 工作区: $FILE"
 
 case "$REL_PATH" in
     ..|../*) die "文件不属于检测到的 Git 工作区: $FILE" ;;
@@ -106,7 +169,12 @@ let s:git_root = $VIMB_GIT_ROOT
 let s:rel_path = $VIMB_REL_PATH
 let s:file_path = $VIMB_FILE
 let s:file_bufnr = bufnr('%')
-let s:file_winid = win_getid()
+let s:source_winid = win_getid()
+" blame 历史栈：层 0 为工作区，Tab 入栈后为历史 commit 层。
+" 每层 {'commit','path','bufnr','records','line','mtime'}
+let s:stack = [{'commit': '', 'path': s:rel_path, 'bufnr': s:file_bufnr,
+            \ 'records': [], 'line': 1, 'mtime': -1}]
+let s:src_bufs = {}   " 'commit:path' → 历史版本 nofile 缓冲区号
 let s:blame_bufnr = -1
 let s:blame_winid = -1
 let s:commit_bufnr = -1
@@ -120,6 +188,13 @@ let s:file_options = {}
 let s:file_maps = {}
 let s:return_view = {}
 let s:pending_records = []
+" Git 执行层：默认走 job_start() 异步；!has('job') 或 VIMB_SYNC=1 时同步。
+let s:async = has('job') && $VIMB_SYNC !=# '1'
+let s:jobs = {}
+let s:job_seq = 0
+let s:blame_gen = 0
+let s:commit_gen = 0
+let s:commit_cache = {}
 
 function! s:Error(message) abort
     echohl ErrorMsg
@@ -155,9 +230,15 @@ function! s:WindowForBuffer(preferred, bufnr) abort
     return 0
 endfunction
 
-function! s:FileWin() abort
-    let s:file_winid = s:WindowForBuffer(s:file_winid, s:file_bufnr)
-    return s:file_winid
+" 源窗口锚定：blame 打开期间窗口内可能切换工作区文件/历史版本缓冲区，
+" 因此以窗口 id 为锚，不按缓冲区反查。
+function! s:SourceWin() abort
+    if s:WindowMatches(s:source_winid, -1)
+        return s:source_winid
+    endif
+    " 兜底：锚失效但真实文件缓冲区还显示在别的窗口
+    let s:source_winid = s:WindowForBuffer(0, s:file_bufnr)
+    return s:source_winid
 endfunction
 
 function! s:BlameWin() abort
@@ -189,18 +270,78 @@ function! s:GitFailure(lines) abort
     return empty(l:text) ? 'Git 命令执行失败' : strpart(l:text, 0, 240)
 endfunction
 
-function! s:ReadBlame() abort
-    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
-                \ . ' blame --no-ext-diff --no-textconv --line-porcelain -- '
-                \ . shellescape(s:rel_path) . ' 2>&1'
-    let l:output = systemlist(l:cmd)
-    if v:shell_error
-        return {'ok': 0, 'error': s:GitFailure(l:output), 'records': []}
-    endif
+" ---- Git 执行层 -----------------------------------------------------------
+" on_done(ok, lines)：所有调用方统一通过回调拿结果，同步/异步无差别。
+function! s:GitLinesSync(cmd, on_done) abort
+    let l:lines = systemlist(a:cmd)
+    return call(a:on_done, [v:shell_error == 0, l:lines])
+endfunction
 
+function! s:JobDone(token) abort
+    if !has_key(s:jobs, a:token)
+        return
+    endif
+    let l:state = remove(s:jobs, a:token)
+    " out_cb 每次回调恰为一行（不含换行符），无需再切分
+    let l:exitval = l:state.exitval
+    if l:exitval == -1 && job_info(l:state.job).status ==# 'dead'
+        let l:exitval = job_info(l:state.job).exitval
+    endif
+    call call(l:state.on_done, [l:exitval == 0, l:state.chunks])
+endfunction
+
+function! s:GitLinesAsync(cmd, on_done) abort
+    let s:job_seq += 1
+    let l:token = s:job_seq
+    let s:jobs[l:token] = {'chunks': [], 'on_done': a:on_done, 'exitval': -1,
+                \ 'job': 0}
+    " 注意 1：job_start() 对字符串命令不经 shell 执行，2>&1 等重定向会变成
+    " 字面参数，必须显式走 sh -c。
+    " 注意 2：exit_cb 触发时 out_cb 可能尚未派发完（大数据量竞态），
+    " 结果统一在 close_cb（通道关闭、输出消费完毕）时派发。
+    let l:job = job_start(['/bin/sh', '-c', a:cmd], {
+        \ 'out_cb': {j, d -> has_key(s:jobs, l:token)
+        \     ? add(s:jobs[l:token].chunks, d) : 0},
+        \ 'exit_cb': {j, st -> has_key(s:jobs, l:token)
+        \     ? extend(s:jobs[l:token], {'exitval': job_info(j).exitval}) : 0},
+        \ 'close_cb': {ch -> s:JobDone(l:token)},
+        \ })
+    if type(l:job) != v:t_number
+        let s:jobs[l:token].job = l:job
+    endif
+    if type(l:job) == v:t_number && l:job == 0
+        call remove(s:jobs, l:token)
+        call s:Error('无法启动后台 Git 任务，回退同步执行')
+        return s:GitLinesSync(a:cmd, a:on_done)
+    endif
+    return 1
+endfunction
+
+function! s:GitLines(cmd, on_done) abort
+    return s:async ? s:GitLinesAsync(a:cmd, a:on_done)
+                \ : s:GitLinesSync(a:cmd, a:on_done)
+endfunction
+
+let s:blame_args = $VIMB_BLAME_ARGS
+
+" ---- blame ----------------------------------------------------------------
+function! s:BlameCmd(commit, path) abort
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' blame --no-ext-diff --no-textconv --line-porcelain'
+    if s:blame_args !=# ''
+        let l:cmd .= ' ' . join(map(split(s:blame_args),
+                    \ 'shellescape(v:val)'), ' ')
+    endif
+    if a:commit !=# ''
+        let l:cmd .= ' ' . shellescape(a:commit)
+    endif
+    return l:cmd . ' -- ' . shellescape(a:path) . ' 2>&1'
+endfunction
+
+function! s:ParseBlameLines(lines) abort
     let l:records = []
     let l:record = {}
-    for l:raw in l:output
+    for l:raw in a:lines
         let l:header = matchlist(l:raw,
                     \ '^\([0-9a-f]\{40,64}\) \(\d\+\) \(\d\+\)\%(\s\+\d\+\)\?$')
         if !empty(l:header)
@@ -210,44 +351,82 @@ function! s:ReadBlame() abort
                         \ 'final_line': str2nr(l:header[3]),
                         \ 'author': '',
                         \ 'author_time': 0,
+                        \ 'author_mail': '',
+                        \ 'previous': '',
+                        \ 'previous_path': '',
+                        \ 'filename': '',
                         \ 'summary': ''}
         elseif empty(l:record)
             continue
         elseif stridx(l:raw, 'author ') == 0
             let l:record.author = strpart(l:raw, 7)
+        elseif stridx(l:raw, 'author-mail ') == 0
+            let l:record.author_mail = strpart(l:raw, 12)
         elseif stridx(l:raw, 'author-time ') == 0
             let l:record.author_time = str2nr(strpart(l:raw, 12))
         elseif stridx(l:raw, 'summary ') == 0
             let l:record.summary = strpart(l:raw, 8)
+        elseif stridx(l:raw, 'previous ') == 0
+            let l:prev = matchlist(strpart(l:raw, 9), '^\(\x\{40,64}\) \(.*\)$')
+            if !empty(l:prev)
+                let l:record.previous = l:prev[1]
+                let l:record.previous_path = l:prev[2]
+            endif
+        elseif stridx(l:raw, 'filename ') == 0
+            let l:record.filename = strpart(l:raw, 9)
         elseif stridx(l:raw, "\t") == 0
             let l:record.text = strpart(l:raw, 1)
             call add(l:records, l:record)
             let l:record = {}
         endif
     endfor
-
-    if !empty(l:output) && empty(l:records)
-        return {'ok': 0, 'error': '无法解析 git blame 输出', 'records': []}
-    endif
-    return {'ok': 1, 'error': '', 'records': l:records}
+    return l:records
 endfunction
 
-function! s:ReadCommit(hash, file_only) abort
-    if a:hash !~# '^\x\{40,64}$' || a:hash =~# '^0\+$'
-        return {'ok': 0, 'error': '该行还没有 commit', 'lines': []}
-    endif
+" ---- commit ---------------------------------------------------------------
+" 当前查看路径：跟随 blame 历史栈顶层（工作区层为原始路径，历史层为当时的
+" 文件路径，rename 追溯时两者不同）
+function! s:CurrentPath() abort
+    return empty(s:stack) ? s:rel_path : s:stack[-1].path
+endfunction
+
+function! s:ShowCommitCmd(hash, file_only) abort
     let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
                 \ . ' show --no-color --no-ext-diff --no-textconv'
                 \ . ' --format=fuller --decorate=no --stat --patch '
                 \ . shellescape(a:hash) . ' --'
     if a:file_only
-        let l:cmd .= ' ' . shellescape(s:rel_path)
+        let l:cmd .= ' ' . shellescape(s:CurrentPath())
     endif
-    let l:output = systemlist(l:cmd . ' 2>&1')
-    if v:shell_error
-        return {'ok': 0, 'error': s:GitFailure(l:output), 'lines': []}
+    return l:cmd . ' 2>&1'
+endfunction
+
+function! s:CommitCacheKey(hash, file_only) abort
+    return a:hash . (a:file_only ? '|file|' . s:CurrentPath() : '|all')
+endfunction
+
+function! s:CacheCommit(key, lines) abort
+    let s:commit_cache[a:key] = a:lines
+    " FIFO 淘汰：最多保留 10 条 commit 渲染结果
+    while len(s:commit_cache) > 10
+        call remove(s:commit_cache, keys(s:commit_cache)[0])
+    endwhile
+endfunction
+
+function! s:LoadCommitLines(hash, file_only, on_done) abort
+    let l:key = s:CommitCacheKey(a:hash, a:file_only)
+    if has_key(s:commit_cache, l:key)
+        return call(a:on_done, [1, s:commit_cache[l:key]])
     endif
-    return {'ok': 1, 'error': '', 'lines': l:output}
+    return s:GitLines(s:ShowCommitCmd(a:hash, a:file_only),
+                \ {ok, lines -> ok
+                \     ? s:CacheCommitThenCall(l:key, lines, a:on_done)
+                \     : call(a:on_done, [ok, lines])})
+endfunction
+
+function! s:CacheCommitThenCall(key, lines, on_done) abort
+    call s:CacheCommit(a:key, a:lines)
+    return call(a:on_done, [1, a:lines])
 endfunction
 
 function! s:ClipAndPad(text, width) abort
@@ -297,6 +476,16 @@ endfunction
 
 function! s:PopulateBlame(records) abort
     let b:vimb_records = deepcopy(a:records)
+    " hash → [行号...] 索引：光标移动时高亮从 O(n) 扫描降为 O(1) 查找
+    let b:vimb_hash_lines = {}
+    let l:index = 0
+    for l:record in a:records
+        if !has_key(b:vimb_hash_lines, l:record.hash)
+            let b:vimb_hash_lines[l:record.hash] = []
+        endif
+        call add(b:vimb_hash_lines[l:record.hash], l:index + 1)
+        let l:index += 1
+    endfor
     call s:ReplaceCurrentBuffer(s:BlameDisplayLines(a:records))
 endfunction
 
@@ -322,6 +511,16 @@ function! s:CurrentRecord() abort
     return get(b:vimb_records, line('.') - 1, {})
 endfunction
 
+" 当前层当前行的 record（源窗口行号 = blame 行号）
+function! s:CurrentLayerRecord() abort
+    let l:records = empty(s:stack) ? [] : s:stack[-1].records
+    let l:line = line('.')
+    if win_getid() != s:SourceWin()
+        let l:line = s:FileLine()
+    endif
+    return get(l:records, l:line - 1, {})
+endfunction
+
 function! s:HighlightCommit() abort
     for l:id in get(w:, 'vimb_match_ids', [])
         silent! call matchdelete(l:id)
@@ -331,12 +530,7 @@ function! s:HighlightCommit() abort
     if empty(l:record)
         return
     endif
-    let l:positions = []
-    for l:index in range(0, len(b:vimb_records) - 1)
-        if b:vimb_records[l:index].hash ==# l:record.hash
-            call add(l:positions, [l:index + 1])
-        endif
-    endfor
+    let l:positions = map(copy(get(b:vimb_hash_lines, l:record.hash, [])), '[v:val]')
     " 同 commit 色块优先级 10，会盖过 cursorline(优先级 2)；
     " 所在行再用优先级 20 叠加更醒目的高亮，避免淹没在色块中。
     if !empty(l:positions)
@@ -346,7 +540,7 @@ function! s:HighlightCommit() abort
 endfunction
 
 function! s:FileLine() abort
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     if !l:fw
         return 1
     endif
@@ -356,7 +550,7 @@ function! s:FileLine() abort
 endfunction
 
 function! s:FileCursorMoved() abort
-    if s:syncing || s:refreshing || win_getid() != s:FileWin()
+    if s:syncing || s:refreshing || win_getid() != s:SourceWin()
         return
     endif
     let l:bw = s:BlameWin()
@@ -381,7 +575,7 @@ function! s:BlameCursorMoved() abort
     if s:syncing || s:refreshing || win_getid() != s:BlameWin()
         return
     endif
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     if !l:fw
         return
     endif
@@ -403,14 +597,22 @@ endfunction
 
 function! s:InstallActiveFileMaps() abort
     let s:file_maps = {}
-    call s:SaveFileMap('<F5>')
+    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o', 'gh', 'gl']
+        call s:SaveFileMap(l:lhs)
+    endfor
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
-    call s:SaveFileMap('<CR>')
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommitAtFileLine()<CR>
+    nnoremap <buffer> <silent> <Tab> :call <SID>PushOlder()<CR>
+    nnoremap <buffer> <silent> <BS> :call <SID>PopNewer()<CR>
+    nnoremap <buffer> <silent> i :call <SID>CommitInfo()<CR>
+    nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
+    nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
+    nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
+    nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
 endfunction
 
 function! s:RestoreActiveFileMapsHere() abort
-    for l:lhs in ['<F5>', '<CR>']
+    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o', 'gh', 'gl']
         execute 'silent! nunmap <buffer> ' . l:lhs
         let l:mapping = get(s:file_maps, l:lhs, {})
         if !empty(l:mapping)
@@ -434,7 +636,7 @@ function! s:ActivateFile() abort
 endfunction
 
 function! s:DeactivateFile() abort
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     execute 'autocmd! VimbWorkspace * <buffer=' . s:file_bufnr . '>'
     if l:fw
         let l:wrap = get(s:file_options, 'wrap', 0)
@@ -467,6 +669,13 @@ function! s:ConfigureBlameBuffer() abort
     " and the complete terminal mouse sequence is consumed before relayout.
     nnoremap <buffer> <silent> <LeftRelease> :call <SID>MouseClick()<CR>
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommit()<CR>
+    nnoremap <buffer> <silent> <Tab> :call <SID>PushOlder()<CR>
+    nnoremap <buffer> <silent> <BS> :call <SID>PopNewer()<CR>
+    nnoremap <buffer> <silent> i :call <SID>CommitInfo()<CR>
+    nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
+    nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
+    nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
+    nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
     nnoremap <buffer> <silent> r :call <SID>Refresh(1)<CR>
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
     nnoremap <buffer> <silent> q :call <SID>CloseBlame()<CR>
@@ -504,6 +713,9 @@ function! s:ConfigureCommitBuffer() abort
     nnoremap <buffer> <silent> <BS> :call <SID>CloseCommit(1)<CR>
     nnoremap <buffer> <silent> <C-o> :call <SID>CloseCommit(1)<CR>
     nnoremap <buffer> <silent> f :call <SID>ToggleCommitScope()<CR>
+    nnoremap <buffer> <silent> i :call <SID>CommitInfo()<CR>
+    nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
+    nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
 
@@ -514,22 +726,82 @@ function! s:ConfigureCommitBuffer() abort
     augroup END
 endfunction
 
+function! s:BlameRequest(mode, notify) abort
+    " mode: 'open' 首次打开 / 'refresh' 刷新 / 'push' 入栈 / 'pop' 出栈
+    let s:blame_gen += 1
+    let l:gen = s:blame_gen
+    let l:bw = s:blame_winid
+    let l:fw = s:source_winid
+    let l:layer = s:stack[-1]
+    call s:GitLines(s:BlameCmd(l:layer.commit, l:layer.path),
+                \ {ok, lines -> s:BlameLoaded(a:mode, a:notify, ok, lines,
+                \     l:gen, l:bw, l:fw)})
+endfunction
+
+function! s:BlameLoaded(mode, notify, ok, lines, gen, bw, fw) abort
+    if a:gen != s:blame_gen || !s:WindowMatches(a:bw, s:blame_bufnr)
+        return
+    endif
+    if !a:ok || empty(s:stack)
+        call s:Error(s:GitFailure(a:lines))
+        if a:mode ==# 'open'
+            call s:CloseBlame()
+        elseif a:mode ==# 'push'
+            call s:PopLayer(0)
+        endif
+        return
+    endif
+    let l:records = s:ParseBlameLines(a:lines)
+    if !empty(a:lines) && empty(l:records)
+        call s:Error('无法解析 git blame 输出')
+        if a:mode ==# 'open'
+            call s:CloseBlame()
+        elseif a:mode ==# 'push'
+            call s:PopLayer(0)
+        endif
+        return
+    endif
+    let s:stack[-1].records = l:records
+    if s:stack[-1].commit ==# ''
+        let s:stack[-1].mtime = getftime(s:file_path)
+    endif
+    call s:ApplyBlameRecords(a:bw, a:fw)
+    call s:UpdateBlameStatusline()
+    if a:mode ==# 'refresh' && a:notify
+        call s:Info('blame 已刷新')
+    endif
+endfunction
+
+" 用当前层记录填充 blame 窗口，并按源窗口行号对齐
+function! s:ApplyBlameRecords(bw, fw) abort
+    let s:refreshing = 1
+    let s:pending_records = s:stack[-1].records
+    try
+        call win_execute(a:bw, 'VimbPopulatePendingBlame')
+        call win_execute(a:bw, 'VimbResizeBlame')
+        let l:line = s:FileLine()
+        call win_execute(a:bw,
+                    \ 'call cursor(min([' . l:line . ', line("$")]), 1)')
+        call win_execute(a:bw, 'VimbHighlightCommit')
+        if s:WindowMatches(a:fw, -1)
+            call win_execute(a:fw, 'syncbind')
+        endif
+    finally
+        let s:pending_records = []
+        let s:refreshing = 0
+    endtry
+endfunction
+
 function! s:OpenBlame() abort
     if s:active && s:BlameWin()
         return
     endif
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     if !l:fw
         call s:Error('原文件窗口已经不存在，拒绝打开 blame')
         return
     endif
     call win_gotoid(l:fw)
-
-    let l:data = s:ReadBlame()
-    if !l:data.ok
-        call s:Error(l:data.error)
-        return
-    endif
 
     let l:file_view = winsaveview()
     try
@@ -539,24 +811,15 @@ function! s:OpenBlame() abort
         let s:blame_bufnr = bufnr('%')
         let s:active = 1
         call s:ConfigureBlameBuffer()
-        call s:PopulateBlame(l:data.records)
-        call s:ResizeBlame()
-
-        let l:target = min([get(l:file_view, 'lnum', 1), line('$')])
-        let l:blame_view = winsaveview()
-        let l:blame_view.lnum = l:target
-        let l:blame_view.col = 1
-        let l:blame_view.topline = min([get(l:file_view, 'topline', 1), line('$')])
-        let l:blame_view.leftcol = 0
-        call winrestview(l:blame_view)
+        call s:ReplaceCurrentBuffer(['(正在加载 blame …)'])
         let w:vimb_hash_match = matchadd('VimbHash', '^\S\+', 20)
-        call s:HighlightCommit()
 
         setlocal scrollbind
         call win_execute(l:fw, 'setlocal scrollbind')
         call win_gotoid(l:fw)
         call winrestview(l:file_view)
         syncbind
+        call s:BlameRequest('open', 0)
     catch
         let l:failure = v:exception
         call s:CloseBlame()
@@ -566,54 +829,426 @@ endfunction
 
 function! s:Refresh(notify) abort
     let l:bw = s:BlameWin()
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     if !l:bw || !l:fw
         if a:notify
             call s:Error('blame 当前未打开')
         endif
         return
     endif
-    let l:data = s:ReadBlame()
-    if !l:data.ok
-        call s:Error(l:data.error)
+    if len(s:stack) > 1
+        if a:notify
+            call s:Info('当前在历史层 ' . (len(s:stack) - 1)
+                        \ . '，按 Backspace 退回工作区后再刷新')
+        endif
         return
     endif
+    call s:BlameRequest('refresh', a:notify)
+endfunction
 
-    let s:refreshing = 1
-    try
-        let l:line = s:FileLine()
-        let s:pending_records = l:data.records
-        call win_execute(l:bw, 'VimbPopulatePendingBlame')
-        call win_execute(l:bw,
-                    \ 'call cursor(min([' . l:line . ', line("$")]), 1)')
-        call win_execute(l:bw, 'VimbResizeBlame')
-        call win_execute(l:bw, 'VimbHighlightCommit')
-        call win_execute(l:fw, 'syncbind')
-    finally
-        let s:pending_records = []
-        let s:refreshing = 0
-    endtry
-    if a:notify
-        call s:Info('blame 已刷新')
+" ---- blame 历史栈 ----------------------------------------------------------
+" git show <commit>:<path>：读取某次提交时的文件内容（同步，单对象读取很快）
+function! s:GitShowFileLines(commit, path) abort
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' show ' . shellescape(a:commit . ':' . a:path) . ' 2>&1'
+    let l:done = []
+    call s:GitLines(l:cmd, {ok, lines -> add(l:done, ok ? lines : [])})
+    " s:GitLines 同步模式下立即回调；异步模式下单对象读取也近乎即时，
+    " 这里用带超时的等待保证两条路径行为一致。
+    let l:rounds = 0
+    while empty(l:done) && l:rounds < 3000
+        sleep 10m
+        let l:rounds += 1
+    endwhile
+    return get(l:done, 0, [])
+endfunction
+
+" 取历史版本缓冲区（懒创建并缓存）
+function! s:EnsureSrcBuffer(commit, path) abort
+    let l:key = a:commit . ':' . a:path
+    if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
+        return s:src_bufs[l:key]
+    endif
+    let l:lines = s:GitShowFileLines(a:commit, a:path)
+    let l:bufnr = bufadd('[vimb-src @' . strpart(a:commit, 0, 10) . ' '
+                \ . fnamemodify(a:path, ':t') . ']')
+    call bufload(l:bufnr)
+    " 去掉行尾 \r，与真实文件窗口的显示保持一致
+    call map(l:lines, 'substitute(v:val, "\r$", "", "")')
+    call setbufline(l:bufnr, 1, empty(l:lines) ? [''] : l:lines)
+    call setbufvar(l:bufnr, '&buftype', 'nofile')
+    call setbufvar(l:bufnr, '&bufhidden', 'hide')
+    call setbufvar(l:bufnr, '&swapfile', 0)
+    call setbufvar(l:bufnr, '&modifiable', 0)
+    call setbufvar(l:bufnr, '&modified', 0)
+    call setbufvar(l:bufnr, '&modeline', 0)
+    call setbufvar(l:bufnr, '&undolevels', -1)
+    call setbufvar(l:bufnr, 'vimb_src', 1)
+    let s:src_bufs[l:key] = l:bufnr
+    return l:bufnr
+endfunction
+
+" 把栈层缓冲区显示到源窗口，并安装栈层专用映射
+function! s:ShowLayerInSource(layer) abort
+    let l:sw = s:SourceWin()
+    if !l:sw
+        return 0
+    endif
+    call win_execute(l:sw, 'noautocmd buffer ' . a:layer.bufnr)
+    if !empty(a:layer.commit)
+        " 栈内历史版本缓冲区：完整操作集（映射随缓冲区，只装一次）
+        if !getbufvar(a:layer.bufnr, 'vimb_maps_done', 0)
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> <CR>'
+                        \ . ' :call <SID>ShowCommitAtFileLine()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> <Tab>'
+                        \ . ' :call <SID>PushOlder()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> <BS>'
+                        \ . ' :call <SID>PopNewer()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> i'
+                        \ . ' :call <SID>CommitInfo()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> y'
+                        \ . ' :call <SID>YankHash()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> o'
+                        \ . ' :call <SID>OpenInBrowser()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> gh'
+                        \ . ' :call <SID>ShowFileHistory()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> gl'
+                        \ . ' :call <SID>ShowLineHistory()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> gb'
+                        \ . ' :call <SID>Toggle()<CR>')
+            call win_execute(l:sw, 'nnoremap <buffer> <silent> ?'
+                        \ . ' :call <SID>Help()<CR>')
+            call setbufvar(a:layer.bufnr, 'vimb_maps_done', 1)
+            augroup VimbWorkspace
+                execute 'autocmd CursorMoved <buffer=' . a:layer.bufnr . '>'
+                            \ . ' call <SID>FileCursorMoved()'
+            augroup END
+        endif
+    endif
+    return 1
+endfunction
+
+" Tab：把当前行追溯到引入它的父提交（入栈）
+function! s:PushOlder() abort
+    if empty(s:stack)
+        return
+    endif
+    let l:record = s:CurrentLayerRecord()
+    if empty(l:record)
+        call s:Error('当前行没有 blame 信息')
+        return
+    endif
+    if l:record.hash =~# '^0\+$'
+        call s:Info('该行是未提交的工作区内容，先提交后才能追溯')
+        return
+    endif
+    if get(l:record, 'previous', '') ==# ''
+        call s:Info('该行已追溯到最早引入它的提交（boundary）')
+        return
+    endif
+    let l:prev = l:record.previous
+    let l:prev_path = get(l:record, 'previous_path', '')
+    if l:prev_path ==# ''
+        let l:prev_path = s:stack[-1].path
+    endif
+    let l:line = get(l:record, 'original_line', 1)
+    let l:bufnr = s:EnsureSrcBuffer(l:prev, l:prev_path)
+    if l:bufnr <= 0
+        call s:Error('无法读取 ' . strpart(l:prev, 0, 10) . ' 版本的文件内容')
+        return
+    endif
+    " 记录当前层光标行，出栈时恢复
+    let s:stack[-1].line = s:FileLine()
+    call add(s:stack, {'commit': l:prev, 'path': l:prev_path,
+                \ 'bufnr': l:bufnr, 'records': [], 'line': l:line, 'mtime': -1})
+    let l:layer = s:stack[-1]
+    let l:sw = s:SourceWin()
+    if !l:sw || !s:ShowLayerInSource(l:layer)
+        call remove(s:stack, -1)
+        call s:Error('源窗口已不存在，无法入栈')
+        return
+    endif
+    let l:count = len(getbufline(l:bufnr, 1, '$'))
+    call win_execute(l:sw,
+                \ 'call cursor(min([' . l:line . ', ' . l:count . ']), 1)')
+    call s:UpdateBlameStatusline()
+    call s:BlameRequest('push', 0)
+endfunction
+
+" Backspace：返回较新的层（出栈）
+function! s:PopNewer() abort
+    if len(s:stack) <= 1
+        call s:Info('已在工作区层')
+        return
+    endif
+    call s:PopLayer(1)
+endfunction
+
+" 出栈一层；show_info 控制是否提示到达工作区层
+function! s:PopLayer(show_info) abort
+    if len(s:stack) <= 1
+        return
+    endif
+    call remove(s:stack, -1)
+    let l:layer = s:stack[-1]
+    let l:sw = s:SourceWin()
+    if !l:sw
+        return
+    endif
+    call s:ShowLayerInSource(l:layer)
+    let l:count = len(getbufline(l:layer.bufnr, 1, '$'))
+    call win_execute(l:sw,
+                \ 'call cursor(min([' . l:layer.line . ', ' . l:count . ']), 1)')
+    call s:UpdateBlameStatusline()
+    let l:bw = s:BlameWin()
+    if !l:bw
+        return
+    endif
+    if !empty(l:layer.records)
+        if l:layer.commit ==# '' && getftime(s:file_path) != l:layer.mtime
+            " 工作区文件在追溯期间被改过，重新加载
+            call s:BlameRequest('pop', 0)
+        else
+            call s:ApplyBlameRecords(l:bw, l:sw)
+        endif
+    else
+        call s:BlameRequest('pop', 0)
+    endif
+    if a:show_info && len(s:stack) == 1
+        call s:Info('已回到工作区层')
     endif
 endfunction
 
-function! s:RenderCommit(record, file_only) abort
-    let l:data = s:ReadCommit(a:record.hash, a:file_only)
-    if !l:data.ok
-        call s:Error(l:data.error)
-        return 0
+" 清空历史栈，源窗口切回工作区文件缓冲区（关闭 blame / 退出前调用）
+function! s:ClearStack() abort
+    let l:sw = s:SourceWin()
+    let l:line = s:stack[-1].line
+    if l:sw && winbufnr(l:sw) != s:file_bufnr
+        call win_execute(l:sw, 'noautocmd buffer ' . s:file_bufnr)
+        let l:count = line('$', l:sw)
+        call win_execute(l:sw,
+                    \ 'call cursor(min([' . l:line . ', ' . l:count . ']), 1)')
     endif
+    let s:stack = [{'commit': '', 'path': s:rel_path, 'bufnr': s:file_bufnr,
+                \ 'records': [], 'line': 1, 'mtime': -1}]
+    for l:bufnr in values(s:src_bufs)
+        if bufexists(l:bufnr)
+            execute 'silent! bwipeout ' . l:bufnr
+        endif
+    endfor
+    let s:src_bufs = {}
+endfunction
+
+function! s:UpdateBlameStatusline() abort
+    let l:bw = s:BlameWin()
+    if !l:bw
+        return
+    endif
+    let l:depth = 'vimb blame'
+    if len(s:stack) > 1
+        let l:depth .= '  ' . (len(s:stack) - 1) . ' 层 @'
+                    \ . strpart(s:stack[-1].commit, 0, 7)
+    endif
+    call win_execute(l:bw, 'let &l:statusline = ' . string(' ' . l:depth
+                \ . '  |  Enter: commit  Tab: 追溯  BS: 返回  q: close '))
+endfunction
+
+" ---- 历史面板：gh 文件历史 / gl 行历史 ------------------------------------
+" 复用底部面板窗口（与 commit 面板互斥，谁后打开谁占位）
+let s:history_winid = -1
+let s:history_bufnr = -1
+let s:history_gen = 0
+
+function! s:ConfigureHistoryBuffer(kind) abort
+    setlocal buftype=nofile
+    setlocal bufhidden=wipe
+    setlocal nobuflisted
+    setlocal noswapfile
+    setlocal nomodeline
+    setlocal nowrap
+    setlocal nonumber norelativenumber
+    setlocal foldcolumn=0
+    setlocal nofoldenable
+    setlocal nospell
+    setlocal undolevels=-1
+    setlocal noscrollbind
+    let b:vimb_history_kind = a:kind
+    let &l:statusline = a:kind ==# 'file'
+                \ ? ' vimb 文件历史  |  gh: 文件  gl: 行  q: 关闭 '
+                \ : ' vimb 行历史  |  gh: 文件  gl: 行  q: 关闭 '
+    silent execute 'file ' . fnameescape('[vimb-history]')
+
+    nnoremap <buffer> <silent> q :call <SID>CloseHistory()<CR>
+    nnoremap <buffer> <silent> <C-c> :call <SID>CloseHistory()<CR>
+    nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
+    nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
+    nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+
+    augroup VimbWorkspace
+        autocmd! * <buffer>
+        autocmd WinEnter <buffer> call <SID>AuxFocusWithoutSource()
+        autocmd BufWipeout <buffer> call <SID>HistoryGone()
+    augroup END
+endfunction
+
+" 历史/commit 共用底部窗口：互斥打开
+function! s:OpenBottomPanel(configure_fn) abort
+    call s:CloseCommit(0)
+    let s:history_winid = s:WindowForBuffer(s:history_winid, s:history_bufnr)
+    if !s:history_winid
+        noautocmd botright new
+        let s:history_winid = win_getid()
+        let s:history_bufnr = bufnr('%')
+        execute 'resize ' . max([8, &lines * 2 / 5])
+        setlocal winfixheight
+    else
+        call win_gotoid(s:history_winid)
+    endif
+    if s:history_bufnr != bufnr('%')
+        " 窗口里换了缓冲区（commit 面板复用同窗口），重配
+        let s:history_bufnr = bufnr('%')
+    endif
+    call call(a:configure_fn, [])
+    return s:history_winid
+endfunction
+
+function! s:CloseHistory() abort
+    if s:WindowMatches(s:history_winid, -1)
+        if win_getid() == s:history_winid
+            silent! close!
+        else
+            call win_execute(s:history_winid, 'silent! close!')
+        endif
+    endif
+    let s:history_winid = -1
+    let s:history_bufnr = -1
+endfunction
+
+function! s:HistoryGone() abort
+    let s:history_winid = -1
+    let s:history_bufnr = -1
+endfunction
+
+function! s:ShowFileHistory() abort
+    let l:sw = s:SourceWin()
+    if !l:sw
+        return
+    endif
+    let l:path = empty(s:stack) ? s:rel_path : s:stack[-1].path
+    let l:commit = empty(s:stack) ? '' : s:stack[-1].commit
+    let l:title = 'vimb 文件历史  ' . l:path
+    let l:rule = repeat('-', min([100, max([40, &columns - 1])]))
+    let l:hw = s:OpenBottomPanel(
+                \ {-> s:ConfigureHistoryBuffer('file')})
+    call win_execute(l:hw, 'call s:ReplaceCurrentBuffer(["' . l:title . '", "' . l:rule . '", "", "(正在加载文件历史 …)"])')
+    let s:history_gen += 1
+    let l:gen = s:history_gen
+    " --follow 让 rename 后仍能追到旧文件的历史；format 串必须整体
+    " 引号包裹，否则 %h 等会被 sh 展开
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . " log --follow --pretty=format:'%h|%an|%ad|%s' --date=short"
+    if l:commit !=# ''
+        let l:cmd .= ' ' . shellescape(l:commit)
+    endif
+    let l:cmd .= ' -- ' . shellescape(l:path) . ' 2>&1'
+    call s:GitLines(l:cmd,
+                \ {ok, lines -> s:HistoryRendered('file', ok, lines, l:gen,
+                \     l:hw, l:title, l:rule, l:path)})
+endfunction
+
+function! s:ShowLineHistory() abort
+    let l:sw = s:SourceWin()
+    if !l:sw
+        return
+    endif
+    let l:path = empty(s:stack) ? s:rel_path : s:stack[-1].path
+    let l:line = s:FileLine()
+    let l:title = 'vimb 行历史  ' . l:path . '  第 ' . l:line . ' 行'
+    let l:rule = repeat('-', min([100, max([40, &columns - 1])]))
+    let l:hw = s:OpenBottomPanel(
+                \ {-> s:ConfigureHistoryBuffer('line')})
+    call win_execute(l:hw, 'call s:ReplaceCurrentBuffer(["' . l:title . '", "' . l:rule . '", "", "(正在加载行历史 …)"])')
+    let s:history_gen += 1
+    let l:gen = s:history_gen
+    let l:cmd = 'env LC_ALL=C git --no-pager -C ' . shellescape(s:git_root)
+                \ . ' log -L ' . l:line . ',' . l:line . ':'
+                \ . shellescape(l:path)
+                \ . " --pretty=format:'COMMIT@%h|%an|%ad|%s'"
+                \ . ' --date=short 2>&1'
+    call s:GitLines(l:cmd,
+                \ {ok, lines -> s:HistoryRendered('line', ok, lines, l:gen,
+                \     l:hw, l:title, l:rule, l:path)})
+endfunction
+
+function! s:HistoryRendered(kind, ok, lines, gen, hw, title, rule, path) abort
+    if a:gen != s:history_gen
+        return
+    endif
+    if s:WindowMatches(a:hw, -1) && winbufnr(a:hw) != s:history_bufnr
+        return
+    endif
+    if !a:ok
+        call win_execute(a:hw,
+                    \ 'call s:ReplaceCurrentBuffer(["(加载历史失败)"])')
+        return
+    endif
+    let l:content = [a:title, a:rule, '']
+    if a:kind ==# 'file'
+        for l:raw in a:lines
+            let l:parts = split(l:raw, '|', 1)
+            if len(l:parts) >= 4
+                call add(l:content, printf('%-10s %-12s %s  %s', l:parts[0],
+                            \ l:parts[1], l:parts[2],
+                            \ join(l:parts[3:], '|')))
+            else
+                call add(l:content, l:raw)
+            endif
+        endfor
+    else
+        " git log -L 输出交织 commit 头与 diff，原样展示
+        let l:content += a:lines
+    endif
+    call win_execute(a:hw,
+                \ 'call s:ReplaceCurrentBuffer(' . string(l:content) . ')')
+endfunction
+
+function! s:RenderCommit(record, file_only) abort
+    let b:vimb_hash = a:record.hash
+    let b:vimb_file_only = a:file_only
+    let b:vimb_summary = get(a:record, 'summary', '')
     let l:scope = a:file_only ? '仅此文件' : '全部文件'
     let l:title = 'vimb commit ' . a:record.hash . '  [' . l:scope . ']'
                 \ . '  f: 切换范围  q/Backspace/Ctrl-O: 返回 '
                 \ . fnamemodify(s:file_path, ':t')
-    call s:ReplaceCurrentBuffer([l:title, repeat('-', min([100, max([40, &columns - 1])])), '']
-                \ + l:data.lines)
-    let b:vimb_hash = a:record.hash
-    let b:vimb_file_only = a:file_only
+    let l:rule = repeat('-', min([100, max([40, &columns - 1])]))
+    " 窗口先就位并显示占位内容，Git 结果就绪后再填充
+    call s:ReplaceCurrentBuffer([l:title, l:rule, '', '(正在加载 commit …)'])
     normal! gg
+    let s:commit_gen += 1
+    let l:gen = s:commit_gen
+    let l:cw = win_getid()
+    call s:LoadCommitLines(a:record.hash, a:file_only,
+                \ {ok, lines -> s:CommitRendered(ok, lines, l:gen, l:cw,
+                \     l:title, l:rule, get(a:record, 'summary', ''))})
     return 1
+endfunction
+
+function! s:CommitRendered(ok, lines, gen, cw, title, rule, summary) abort
+    if a:gen != s:commit_gen || !s:WindowMatches(a:cw, s:commit_bufnr)
+        return
+    endif
+    if !a:ok
+        call s:Error(s:GitFailure(a:lines))
+        call win_execute(a:cw,
+                    \ 'call s:ReplaceCurrentBuffer(["(加载 commit 失败)"])')
+        return
+    endif
+    let l:content = [a:title, a:rule, ''] + a:lines
+    call win_execute(a:cw,
+                \ 'call s:ReplaceCurrentBuffer(' . string(l:content) . ')')
+    call win_execute(a:cw, 'normal! gg')
+    call s:Info(strpart(getbufvar(winbufnr(a:cw), 'vimb_hash'), 0, 12) . '  '
+                \ . (empty(a:summary) ? getbufvar(winbufnr(a:cw), 'vimb_summary', '') : a:summary))
 endfunction
 
 function! s:OpenCommitForRecord(record) abort
@@ -622,7 +1257,7 @@ function! s:OpenCommitForRecord(record) abort
         return
     endif
 
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     let l:bw = s:BlameWin()
     if !l:fw || !l:bw
         call s:Error('vimb 窗口状态已失效')
@@ -634,6 +1269,7 @@ function! s:OpenCommitForRecord(record) abort
     let l:cw = s:CommitWin()
 
     if !l:cw
+        call s:CloseHistory()
         noautocmd botright new
         let s:commit_winid = win_getid()
         let s:commit_bufnr = bufnr('%')
@@ -649,10 +1285,7 @@ function! s:OpenCommitForRecord(record) abort
     " 同一个 commit 重复打开时保留已选的查看范围，新 commit 默认只看当前文件
     let l:file_only = (get(b:, 'vimb_hash', '') ==# a:record.hash)
                 \ ? get(b:, 'vimb_file_only', 1) : 1
-    if s:RenderCommit(a:record, l:file_only)
-        call s:Info(strpart(a:record.hash, 0, 12) . '  '
-                    \ . get(a:record, 'summary', ''))
-    endif
+    call s:RenderCommit(a:record, l:file_only)
 endfunction
 
 function! s:ShowCommit() abort
@@ -668,7 +1301,7 @@ function! s:ShowCommit() abort
 endfunction
 
 function! s:ShowCommitAtFileLine() abort
-    if win_getid() != s:FileWin()
+    if win_getid() != s:SourceWin()
         return
     endif
     if !s:BlameWin()
@@ -677,7 +1310,7 @@ function! s:ShowCommitAtFileLine() abort
             return
         endif
     endif
-    let l:records = getbufvar(s:blame_bufnr, 'vimb_records', [])
+    let l:records = empty(s:stack) ? [] : s:stack[-1].records
     let l:record = get(l:records, line('.') - 1, {})
     if empty(l:record)
         call s:Error('当前行没有 blame 信息')
@@ -690,7 +1323,8 @@ function! s:ToggleCommitScope() abort
     if win_getid() != s:CommitWin() || !exists('b:vimb_hash')
         return
     endif
-    call s:RenderCommit({'hash': b:vimb_hash}, !get(b:, 'vimb_file_only', 1))
+    call s:RenderCommit({'hash': b:vimb_hash, 'summary': get(b:, 'vimb_summary', '')},
+                \ !get(b:, 'vimb_file_only', 1))
 endfunction
 
 function! s:CloseAuxWindow(winid) abort
@@ -705,7 +1339,7 @@ function! s:CloseAuxWindow(winid) abort
 endfunction
 
 function! s:ReturnToFile() abort
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
     if !l:fw
         call s:Error('原文件窗口已经不存在')
         return
@@ -745,11 +1379,16 @@ function! s:CommitGone() abort
 endfunction
 
 function! s:CloseBlame() abort
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
+    " 先清历史栈把源窗口切回真实文件，再按真实文件视图恢复
+    if len(s:stack) > 1
+        call s:ClearStack()
+    endif
     let l:file_view = l:fw ? s:CaptureView(l:fw) : {}
     let s:closing_blame = 1
     try
         call s:CloseCommit(0)
+        call s:CloseHistory()
         let l:bw = s:BlameWin()
         if l:bw
             call s:CloseAuxWindow(l:bw)
@@ -775,11 +1414,15 @@ function! s:BlameGone() abort
     if s:closing_blame
         return
     endif
-    let l:fw = s:FileWin()
+    let l:fw = s:SourceWin()
+    if len(s:stack) > 1
+        call s:ClearStack()
+    endif
     let l:view = l:fw ? s:CaptureView(l:fw) : {}
     let s:closing_blame = 1
     try
         call s:CloseCommit(0)
+        call s:CloseHistory()
         call s:DeactivateFile()
     finally
         let s:closing_blame = 0
@@ -794,18 +1437,22 @@ function! s:SourceGone() abort
     let s:closing_blame = 1
     try
         call s:CloseCommit(0)
+        call s:CloseHistory()
         call s:CloseAuxWindow(s:BlameWin())
     finally
         let s:closing_blame = 0
     endtry
     let s:active = 0
-    let s:file_winid = -1
+    let s:source_winid = -1
+    let s:stack = [{'commit': '', 'path': s:rel_path, 'bufnr': s:file_bufnr,
+                \ 'records': [], 'line': 1, 'mtime': -1}]
+    let s:src_bufs = {}
 endfunction
 
 function! s:AuxFocusWithoutSource() abort
     " 文件窗口被 :q / :wq / ZZ / <C-w>c 关闭后，焦点落入辅助面板时，
     " 面板已失去意义，直接退出，保证一次 :q 即可离开 vimb。
-    if s:closing_blame || s:refreshing || s:FileWin()
+    if s:closing_blame || s:refreshing || s:SourceWin()
         return
     endif
     let s:closing_blame = 1
@@ -838,13 +1485,154 @@ function! s:Toggle() abort
     endif
 endfunction
 
+" ---- 快捷操作: i / y / o ---------------------------------------------------
+" 当前上下文的 record 与 hash（blame 窗口 / 源窗口 / commit 面板各取各的）
+function! s:FocusRecord() abort
+    if win_getid() == s:BlameWin()
+        return s:CurrentRecord()
+    elseif win_getid() == s:SourceWin()
+        return s:CurrentLayerRecord()
+    endif
+    return {}
+endfunction
+
+function! s:FocusHash() abort
+    if win_getid() == s:CommitWin() && exists('b:vimb_hash')
+        return b:vimb_hash
+    endif
+    let l:record = s:FocusRecord()
+    return empty(l:record) ? '' : l:record.hash
+endfunction
+
+" i：轻量 commit 信息（纯内存，零 Git 调用）
+function! s:CommitInfo() abort
+    let l:record = s:FocusRecord()
+    if empty(l:record)
+        call s:Error('当前行没有 blame 信息')
+        return
+    endif
+    if l:record.hash =~# '^0\+$'
+        call s:Info('该行是未提交的工作区内容')
+        return
+    endif
+    let l:mail = substitute(get(l:record, 'author_mail', ''), '^<\|>$', '', 'g')
+    let l:date = get(l:record, 'author_time', 0) > 0
+                \ ? strftime('%Y-%m-%d %H:%M', l:record.author_time) : ''
+    let l:lines = [
+                \ 'Commit   ' . strpart(l:record.hash, 0, 12),
+                \ 'Author   ' . get(l:record, 'author', '?')
+                \ . (empty(l:mail) ? '' : '  <' . l:mail . '>'),
+                \ 'Date     ' . l:date,
+                \ 'File     ' . (empty(s:stack) ? s:rel_path : s:stack[-1].path),
+                \ ]
+    if get(l:record, 'previous', '') !=# ''
+        call add(l:lines, 'Prev     ' . strpart(l:record.previous, 0, 12)
+                    \ . '  (' . get(l:record, 'previous_path', '') . ')')
+    endif
+    call add(l:lines, '')
+    call add(l:lines, get(l:record, 'summary', ''))
+    if exists('*popup_atcursor')
+        call popup_atcursor(l:lines, {'moved': 'any', 'padding': [0, 1, 0, 1],
+                    \ 'border': [], 'borderchars': [' '], 'wrap': 0})
+    else
+        echo join(l:lines, "\n")
+    endif
+endfunction
+
+" y：复制当前 commit 完整 SHA
+function! s:YankHash() abort
+    let l:hash = s:FocusHash()
+    if empty(l:hash)
+        call s:Error('当前位置没有可复制的 commit')
+        return
+    endif
+    if l:hash =~# '^0\+$'
+        call s:Info('该行是未提交的工作区内容，没有 commit 可复制')
+        return
+    endif
+    let @" = l:hash
+    for l:reg in ['+', '*']
+        try
+            call setreg(l:reg, l:hash)
+        catch
+        endtry
+    endfor
+    call s:Info('已复制 ' . strpart(l:hash, 0, 12)
+                \ . (empty(@+) ? '' : '（含系统剪贴板）'))
+endfunction
+
+" o：在浏览器打开 commit
+let s:remote_url = ''
+function! s:CommitWebURL(hash) abort
+    if a:hash =~# '^0\+$'
+        return ''
+    endif
+    if s:remote_url ==# ''
+        let l:out = systemlist('git --no-pager -C ' . shellescape(s:git_root)
+                    \ . ' remote get-url origin 2>/dev/null')
+        if v:shell_error || empty(l:out)
+            throw '无法获取 origin 远端 URL（git remote get-url origin 失败）'
+        endif
+        let s:remote_url = l:out[0]
+    endif
+    let l:url = s:remote_url
+    " git@host:path(.git) / ssh://git@host/path(.git) / https://host/path(.git)
+    let l:m = matchlist(l:url, '^\%(ssh://\)\?git@\([^:/]\+\)[/:]\(.\+\)$')
+    if empty(l:m)
+        let l:m = matchlist(l:url, '^https\?://\([^/]\+\)/\(.\+\)$')
+    endif
+    if empty(l:m)
+        throw '无法解析远端 URL: ' . l:url
+    endif
+    let l:host = l:m[1]
+    let l:path = substitute(l:m[2], '\.git$', '', '')
+    if l:host =~# '\<github\.com$'
+        return 'https://' . l:host . '/' . l:path . '/commit/' . a:hash
+    elseif l:host =~# '\<gitlab\.[^./]*\|\<gitlab\>'
+        return 'https://' . l:host . '/' . l:path . '/-/commit/' . a:hash
+    elseif l:host =~# '\<gitee\.com$'
+        return 'https://' . l:host . '/' . l:path . '/commit/' . a:hash
+    elseif l:host =~# '\<bitbucket\.org$'
+        return 'https://' . l:host . '/' . l:path . '/commits/' . a:hash
+    elseif l:host =~# '\<sr\.ht$'
+        return 'https://' . l:host . '/' . l:path . '/commit/' . a:hash
+    elseif l:host =~# '^gerrit\.\|[-.]gerrit\.'
+        return 'https://' . l:host . '/c/' . l:path . '/+/' . a:hash
+    endif
+    throw '未识别的远端类型: ' . l:url
+endfunction
+
+function! s:OpenInBrowser() abort
+    let l:hash = s:FocusHash()
+    if empty(l:hash)
+        call s:Error('当前位置没有可打开的 commit')
+        return
+    endif
+    try
+        let l:url = s:CommitWebURL(l:hash)
+    catch
+        call s:Error(substitute(v:exception, '^Vim\%((\w*)\)\=:', '', '')
+                    \ . '；可手动用 o 前先确认远端配置')
+        return
+    endtry
+    let l:runner = executable('xdg-open') ? 'xdg-open'
+                \ : executable('open') ? 'open' : ''
+    if empty(l:runner)
+        call s:Info('未找到 xdg-open/open，URL: ' . l:url)
+        return
+    endif
+    call system(l:runner . ' ' . shellescape(l:url) . ' &')
+    call s:Info('已打开 ' . l:url)
+endfunction
+command! -nargs=1 VimbCommitURL echo <SID>CommitWebURL(<f-args>)
+
 function! s:Help() abort
     if s:CommitWin()
-        call s:Info('commit: f 切换仅此文件/全部文件；q/Backspace/Ctrl-O 返回原文件；gb 关闭全部辅助面板')
+        call s:Info('commit: f 仅此文件/全部文件；i 信息；y 复制 SHA；o 浏览器打开；gh 文件历史；gl 行历史；q/Backspace/Ctrl-O 返回；gb 关闭全部')
     elseif win_getid() == s:BlameWin()
-        call s:Info('blame: 单击/Enter 查看 commit；r 刷新；q 关闭')
+        call s:Info('blame: Enter 查看 commit；Tab 追溯历史；BS 返回；i 信息；y 复制 SHA；o 浏览器；gh/gl 历史；r 刷新；q 关闭')
     else
-        call s:Info('文件: Enter 查看当前行 commit；gb 显示/隐藏 blame；blame 打开时 F5 刷新')
+        call s:Info('文件: Enter 查看 commit；Tab/BS 历史；i 信息；y 复制 SHA；o 浏览器；gh 文件历史；gl 行历史；gb 显示/隐藏 blame；F5 刷新')
     endif
 endfunction
 
@@ -861,18 +1649,40 @@ command! -bar VimbResizeBlame call <SID>ResizeBlame()
 command! -bar VimbPopulatePendingBlame call <SID>PopulatePendingBlame()
 command! -bar VimbRestoreFileMaps call <SID>RestoreActiveFileMapsHere()
 
+" 内部测试钩子：等待所有后台 Git job 结束（带超时），无 job 时立即返回。
+function! s:WaitJobs() abort
+    let l:rounds = 0
+    while !empty(s:jobs) && l:rounds < 1000
+        sleep 10m
+        let l:rounds += 1
+    endwhile
+endfunction
+command! -bar VimbWait call <SID>WaitJobs()
+
 if resolve(expand('%:p')) !=# resolve(s:file_path)
     call s:Error('启动文件与请求文件不一致，已中止 blame 初始化')
 else
     setlocal number
     nnoremap <buffer> <silent> gb :call <SID>Toggle()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
-    call s:OpenBlame()
+    " 内部测试钩子：VIMB_NO_AUTO_OPEN=1 时不自动打开 blame
+    if $VIMB_NO_AUTO_OPEN !=# '1'
+        call s:OpenBlame()
+    endif
+endif
+
+" 内部测试钩子：VIMB_TEST_CMDS 每行一条 Ex 命令，在初始化完成后执行
+" （仅用于回归测试，普通使用无需关心）。
+if $VIMB_TEST_CMDS !=# ''
+    for s:test_cmd in split($VIMB_TEST_CMDS, "\n", 1)
+        execute s:test_cmd
+    endfor
 endif
 VIMSCRIPT
 
 export VIMB_GIT_ROOT="$GIT_ROOT"
 export VIMB_REL_PATH="$REL_PATH"
 export VIMB_FILE="$FILE"
+export VIMB_BLAME_ARGS="${BLAME_EXTRA_ARGS# }"
 
 vim -N -S "$VIM_SCRIPT" -- "$FILE"

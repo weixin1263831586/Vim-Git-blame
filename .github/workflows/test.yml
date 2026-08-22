@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vim git
+      - name: Run regression tests
+        run: bash test/run.sh
+      - name: Run regression tests (sync git path)
+        env:
+          VIMB_SYNC: '1'
+        run: bash test/run.sh
+      - name: Check script syntax
+        run: |
+          bash -n vimb
+          ./vimb --version
