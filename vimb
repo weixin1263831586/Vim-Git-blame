@@ -90,9 +90,16 @@ endif
 set ttimeout
 set ttimeoutlen=100
 
-highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
-highlight default VimbCurrentLine cterm=bold ctermbg=201 ctermfg=0
-            \ gui=bold guibg=#ff00ff guifg=#000000
+if has('gui_running') || &t_Co >= 256
+    highlight default VimbCurrentLine cterm=bold ctermbg=201 ctermfg=0
+                \ gui=bold guibg=#ff00ff guifg=#000000
+    highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
+else
+    " TERM=xterm 等低色彩终端：256 色号码会被近似成灰色，改用 ANSI 原色
+    highlight default VimbCurrentLine cterm=bold ctermbg=5 ctermfg=15
+                \ gui=bold guibg=#ff00ff guifg=#000000
+    highlight default VimbSameCommit cterm=NONE ctermbg=8 gui=NONE guibg=#3a3f44
+endif
 highlight default link VimbHash Comment
 
 let s:git_root = $VIMB_GIT_ROOT
