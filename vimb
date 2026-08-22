@@ -92,7 +92,6 @@ set ttimeoutlen=100
 highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
 highlight default link VimbHash Comment
 
-let s:sid = expand('<SID>')
 let s:git_root = $VIMB_GIT_ROOT
 let s:rel_path = $VIMB_REL_PATH
 let s:file_path = $VIMB_FILE
@@ -353,7 +352,7 @@ function! s:FileCursorMoved() abort
         let l:target = line('.')
         call win_execute(l:bw,
                     \ 'call cursor(min([' . l:target . ', line("$")]), 1)')
-        call win_execute(l:bw, 'call ' . s:sid . 'HighlightCommit()')
+        call win_execute(l:bw, 'VimbHighlightCommit')
         if s:CommitWin()
             let s:return_view = winsaveview()
         endif
@@ -424,7 +423,7 @@ function! s:DeactivateFile() abort
         let l:scrollbind = get(s:file_options, 'scrollbind', 0)
         call win_execute(l:fw, 'let &l:wrap = ' . l:wrap
                     \ . ' | let &l:scrollbind = ' . l:scrollbind)
-        call win_execute(l:fw, 'call ' . s:sid . 'RestoreActiveFileMapsHere()')
+        call win_execute(l:fw, 'VimbRestoreFileMaps')
     endif
     let s:file_options = {}
 endfunction
@@ -563,11 +562,11 @@ function! s:Refresh(notify) abort
     try
         let l:line = s:FileLine()
         let s:pending_records = l:data.records
-        call win_execute(l:bw, 'call ' . s:sid . 'PopulatePendingBlame()')
+        call win_execute(l:bw, 'VimbPopulatePendingBlame')
         call win_execute(l:bw,
                     \ 'call cursor(min([' . l:line . ', line("$")]), 1)')
-        call win_execute(l:bw, 'call ' . s:sid . 'ResizeBlame()')
-        call win_execute(l:bw, 'call ' . s:sid . 'HighlightCommit()')
+        call win_execute(l:bw, 'VimbResizeBlame')
+        call win_execute(l:bw, 'VimbHighlightCommit')
         call win_execute(l:fw, 'syncbind')
     finally
         let s:pending_records = []
@@ -776,6 +775,14 @@ command! -bar VimbToggle call <SID>Toggle()
 command! -bar VimbRefresh call <SID>Refresh(1)
 command! -bar VimbBack call <SID>CloseCommit(1)
 command! -bar VimbHelp call <SID>Help()
+
+" win_execute() 需要字符串命令，而 expand('<SID>') 在部分环境下返回空，
+" 不能在运行期拼接 <SNR> 前缀。这些命令在定义期完成 <SID> 展开，供
+" win_execute() 间接调用脚本局部函数。
+command! -bar VimbHighlightCommit call <SID>HighlightCommit()
+command! -bar VimbResizeBlame call <SID>ResizeBlame()
+command! -bar VimbPopulatePendingBlame call <SID>PopulatePendingBlame()
+command! -bar VimbRestoreFileMaps call <SID>RestoreActiveFileMapsHere()
 
 if resolve(expand('%:p')) !=# resolve(s:file_path)
     call s:Error('启动文件与请求文件不一致，已中止 blame 初始化')
