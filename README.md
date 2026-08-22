@@ -19,8 +19,8 @@
 ## 安装
 
 ```bash
-git clone git@github.com:weixin1263831586/vimb.git
-install -m 755 vimb/vimb ~/.local/bin/vimb
+git clone git@github.com:weixin1263831586/Vim-Git-blame.git
+install -m 755 Vim-Git-blame/vimb ~/.local/bin/vimb
 ```
 
 要求 `~/.local/bin` 在 `PATH` 中。
