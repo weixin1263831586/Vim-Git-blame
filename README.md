@@ -11,6 +11,8 @@
 - 当前行的 commit 自动高亮，同属一个 commit 的所有行一起标出
 - 鼠标单击或 Enter 查看该行所属 commit 的完整信息（fuller 格式 + stat + patch）
 - **Tab 向前追溯**：基于 `previous` 字段入栈显示历史版本文件，rename/移动过的代码自动跟随旧路径；Backspace 逐层返回，blame 栏显示当前深度（如 `vimb blame 2 层 @79583ef`）
+- blame 视觉增强：连续相同 commit 的行合并显示（块首行显示作者/日期）、相邻 commit 块循环底色区分（256 色终端）、commit 年龄热力（hash 列按新旧绿→蓝→灰着色）
+- 源窗口状态栏常驻显示当前行 commit 摘要（current-line compact 模式），关闭 blame 后恢复
 - `gh` 文件历史（`git log --follow`，rename 后继续追溯）；`gl` 当前行历史（`git log -L`）
 - `i` 轻量 commit 信息 popup（作者/日期/previous，纯内存零 Git 调用）
 - `y` 复制完整 commit SHA（尽力同步系统剪贴板）
@@ -110,7 +112,7 @@ bash test/run.sh          # 回归测试（异步路径）
 VIMB_SYNC=1 bash test/run.sh   # 同步路径再跑一遍
 ```
 
-测试覆盖：普通文件、文件名含空格、中文文件名、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项与用户映射、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行、快捷键与 URL 构造、文件/行历史面板、blame 附加参数。
+测试覆盖：普通文件、文件名含空格、中文文件名、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项与用户映射、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行、快捷键与 URL 构造、文件/行历史面板、blame 附加参数、视觉增强（合并显示/年龄热力/compact 状态栏）。
 
 ## 许可
 

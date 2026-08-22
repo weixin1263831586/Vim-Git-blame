@@ -159,7 +159,8 @@ stack:code.c:stack.vim:
 stack_rename:new_name.txt:stack_rename.vim:
 keys:code.c:keys.vim:
 history:code.c:history.vim:
-blameargs:code.c:blameargs.vim::VIMB_BLAME_ARGS=-w'
+blameargs:code.c:blameargs.vim::VIMB_BLAME_ARGS=-w
+visual:code.c:visual.vim:'
 
 # ALL_CASES 为冒号分隔的多行串：名称:文件:用例脚本[:noauto[:额外env]]
 run_all() {

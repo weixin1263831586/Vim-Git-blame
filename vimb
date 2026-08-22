@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 usage() {
     cat <<'EOF'
@@ -157,13 +157,29 @@ if has('gui_running') || &t_Co >= 256
     highlight default VimbCurrentLine cterm=bold ctermbg=201 ctermfg=0
                 \ gui=bold guibg=#ff00ff guifg=#000000
     highlight default VimbSameCommit cterm=NONE ctermbg=236 gui=NONE guibg=#3a3f44
+    " 相邻 commit 块循环使用的底色（低色彩终端不启用，见 DefineBlameSyntax）
+    highlight default VimbC0 cterm=NONE ctermbg=233 gui=NONE guibg=#121212
+    highlight default VimbC1 cterm=NONE ctermbg=235 gui=NONE guibg=#262626
+    highlight default VimbC2 cterm=NONE ctermbg=238 gui=NONE guibg=#444444
+    highlight default VimbC3 cterm=NONE ctermbg=240 gui=NONE guibg=#585858
 else
     " TERM=xterm 等低色彩终端：256 色号码会被近似成灰色，改用 ANSI 原色
     highlight default VimbCurrentLine cterm=bold ctermbg=5 ctermfg=15
                 \ gui=bold guibg=#ff00ff guifg=#000000
     highlight default VimbSameCommit cterm=NONE ctermbg=8 gui=NONE guibg=#3a3f44
 endif
+" commit 年龄热力：hash 列按提交新旧着色（ANSI 安全色，任何终端可用）
+highlight default VimbAge0 ctermfg=10 guifg=#00d700
+highlight default VimbAge1 ctermfg=2 guifg=#5faf00
+highlight default VimbAge2 ctermfg=4 guifg=#0087af
+highlight default VimbAge3 ctermfg=8 guifg=#808080
 highlight default link VimbHash Comment
+
+" per-commit 配色块用语法项实现（matchaddpos 每项最多 8 个位置，大块会爆量），
+" 需要语法引擎开启；不影响未设置 filetype 的文件缓冲区
+if has('syntax') && !exists('g:syntax_on')
+    syntax enable
+endif
 
 let s:git_root = $VIMB_GIT_ROOT
 let s:rel_path = $VIMB_REL_PATH
@@ -451,17 +467,24 @@ function! s:BlameDisplayLines(records) abort
     endif
     let l:number_width = max([4, strlen(string(len(a:records)))])
     let l:lines = []
+    let l:last_hash = ''
     for l:record in a:records
-        let l:hash = l:record.hash =~# '^0\+$'
-                    \ ? 'WORKTREE'
-                    \ : strpart(l:record.hash, 0, 10)
-        let l:date = get(l:record, 'author_time', 0) > 0
-                    \ ? strftime('%Y-%m-%d', l:record.author_time)
-                    \ : '----------'
-        let l:author = s:ClipAndPad(get(l:record, 'author', '?'), 12)
-        call add(l:lines, printf('%-10s %s %s %*d',
+        " 连续相同 commit 的行只保留行号，块信息在块首行显示一次，
+        " 便于扫读；b:vimb_records 仍逐行完整保留
+        let l:compact = l:record.hash ==# l:last_hash
+        let l:hash = l:compact ? '' :
+                    \ (l:record.hash =~# '^0\+$'
+                    \     ? 'WORKTREE'
+                    \     : strpart(l:record.hash, 0, 10))
+        let l:date = l:compact ? '' :
+                    \ (get(l:record, 'author_time', 0) > 0
+                    \     ? strftime('%Y-%m-%d', l:record.author_time)
+                    \     : '----------')
+        let l:author = l:compact ? '' : get(l:record, 'author', '?')
+        call add(l:lines, printf('%-10s %-12s %-10s %*d',
                     \ l:hash, l:author, l:date, l:number_width,
                     \ get(l:record, 'final_line', len(l:lines) + 1)))
+        let l:last_hash = l:record.hash
     endfor
     return l:lines
 endfunction
@@ -487,6 +510,86 @@ function! s:PopulateBlame(records) abort
         let l:index += 1
     endfor
     call s:ReplaceCurrentBuffer(s:BlameDisplayLines(a:records))
+    call s:DefineBlameSyntax(a:records)
+endfunction
+
+" ---- v2.4 视觉：per-commit 配色块 + commit 年龄热力 ------------------------
+" 年龄分档：相对 records 中最新提交的间隔天数
+"   0: 30 天内(亮绿)  1: 1 年内(绿)  2: 3 年内(蓝)  3: 更早(灰)
+function! s:AgeBucket(author_time, newest) abort
+    if a:author_time <= 0 || a:newest <= 0
+        return 3
+    endif
+    let l:days = (a:newest - a:author_time) / 86400
+    if l:days <= 30
+        return 0
+    elseif l:days <= 365
+        return 1
+    elseif l:days <= 1095
+        return 2
+    endif
+    return 3
+endfunction
+
+function! s:DefineBlameSyntax(records) abort
+    " 年龄热力（hash 列前景色）任何终端都开；per-commit 色块需要 256 色
+    let l:newest = 0
+    for l:record in a:records
+        if get(l:record, 'author_time', 0) > l:newest
+            let l:newest = l:record.author_time
+        endif
+    endfor
+    syntax clear
+    unlet! b:current_syntax
+    if !(has('syntax') && (has('gui_running') || &t_Co >= 256))
+        " 低色彩终端：仅年龄热力
+        for l:bucket in range(4)
+            let l:pat = s:AgePattern(a:records, l:newest, l:bucket)
+            if !empty(l:pat)
+                execute 'syntax match VimbAge' . l:bucket . ' /\%(' . l:pat
+                            \ . '\)\%10c/ containedin=ALL'
+            endif
+        endfor
+        return
+    endif
+    " 相邻 commit 块循环 4 色：按块序取模
+    let l:block = 0
+    let l:last_hash = ''
+    for l:record in a:records
+        if l:record.hash !=# l:last_hash
+            let l:block += 1
+            let l:last_hash = l:record.hash
+        endif
+        let l:group = 'VimbC' . (l:block % 4)
+        let l:line = get(l:record, 'final_line', 0)
+        if l:line > 0
+            execute 'syntax region ' . l:group . ' start=/\%' . l:line
+                        \ . 'l\%^/ end=/\%' . l:line . 'l\%$/'
+        endif
+        " 块首行 hash 列按年龄着色（region 只盖底色，前景让给年龄组）
+        if l:record.hash !=# get(get(a:records, l:line - 2, {}), 'hash', '')
+            let l:bucket = s:AgeBucket(get(l:record, 'author_time', 0), l:newest)
+            let l:age_pat = '\%' . l:line . 'l\%1c\S\+\%10c'
+            execute 'syntax match VimbAge' . l:bucket . ' /' . l:age_pat . '/'
+        endif
+    endfor
+endfunction
+
+" 生成某年龄档所有块首行 hash 列的匹配模式（低色彩终端用）
+function! s:AgePattern(records, newest, bucket) abort
+    let l:parts = []
+    let l:last_hash = ''
+    let l:index = 0
+    for l:record in a:records
+        if l:record.hash !=# l:last_hash
+            let l:last_hash = l:record.hash
+            if s:AgeBucket(get(l:record, 'author_time', 0), a:newest) ==# a:bucket
+                call add(l:parts, '\%' . (l:index + 1) . 'l\%1c\S\+\%10c')
+            endif
+        endif
+        let l:index += 1
+    endfor
+    return join(l:parts, '\|')
 endfunction
 
 function! s:PopulatePendingBlame() abort
@@ -549,6 +652,32 @@ function! s:FileLine() abort
     return s:captured_line
 endfunction
 
+" current-line compact 模式：源窗口状态栏常驻当前行 commit 摘要
+function! s:UpdateCompactStatusline() abort
+    let l:sw = s:SourceWin()
+    if !l:sw
+        return
+    endif
+    let l:record = get(empty(s:stack) ? [] : s:stack[-1].records,
+                \ s:FileLine() - 1, {})
+    let l:info = ''
+    if !empty(l:record)
+        if l:record.hash =~# '^0\+$'
+            let l:info = 'WORKTREE（未提交）'
+        else
+            let l:info = strpart(l:record.hash, 0, 10)
+                        \ . '  ' . get(l:record, 'author', '?')
+            if get(l:record, 'author_time', 0) > 0
+                let l:info .= '  ' . strftime('%Y-%m-%d', l:record.author_time)
+            endif
+            let l:info .= '  ' . strpart(
+                        \ substitute(get(l:record, 'summary', ''), '\s\+', ' ', 'g'),
+                        \ 0, 60)
+        endif
+    endif
+    call win_execute(l:sw, 'let &l:statusline = ' . string(' vimb  ' . l:info))
+endfunction
+
 function! s:FileCursorMoved() abort
     if s:syncing || s:refreshing || win_getid() != s:SourceWin()
         return
@@ -563,6 +692,7 @@ function! s:FileCursorMoved() abort
         call win_execute(l:bw,
                     \ 'call cursor(min([' . l:target . ', line("$")]), 1)')
         call win_execute(l:bw, 'VimbHighlightCommit')
+        call s:UpdateCompactStatusline()
         if s:CommitWin()
             let s:return_view = winsaveview()
         endif
@@ -584,6 +714,7 @@ function! s:BlameCursorMoved() abort
         let l:target = line('.')
         call win_execute(l:fw, 'call cursor(' . l:target . ', col("."))')
         call s:HighlightCommit()
+        call s:UpdateCompactStatusline()
     finally
         let s:syncing = 0
     endtry
@@ -623,7 +754,8 @@ function! s:RestoreActiveFileMapsHere() abort
 endfunction
 
 function! s:ActivateFile() abort
-    let s:file_options = {'wrap': &l:wrap, 'scrollbind': &l:scrollbind}
+    let s:file_options = {'wrap': &l:wrap, 'scrollbind': &l:scrollbind,
+                \ 'statusline': &l:statusline}
     setlocal nowrap
     setlocal noscrollbind
     call s:InstallActiveFileMaps()
@@ -641,8 +773,11 @@ function! s:DeactivateFile() abort
     if l:fw
         let l:wrap = get(s:file_options, 'wrap', 0)
         let l:scrollbind = get(s:file_options, 'scrollbind', 0)
+        let l:statusline = get(s:file_options, 'statusline', '')
         call win_execute(l:fw, 'let &l:wrap = ' . l:wrap
                     \ . ' | let &l:scrollbind = ' . l:scrollbind)
+        call win_execute(l:fw, 'let &l:statusline = '
+                    \ . string(substitute(l:statusline, "'", "''", 'g')))
         call win_execute(l:fw, 'VimbRestoreFileMaps')
     endif
     let s:file_options = {}
@@ -786,6 +921,7 @@ function! s:ApplyBlameRecords(bw, fw) abort
         if s:WindowMatches(a:fw, -1)
             call win_execute(a:fw, 'syncbind')
         endif
+        call s:UpdateCompactStatusline()
     finally
         let s:pending_records = []
         let s:refreshing = 0
@@ -812,7 +948,6 @@ function! s:OpenBlame() abort
         let s:active = 1
         call s:ConfigureBlameBuffer()
         call s:ReplaceCurrentBuffer(['(正在加载 blame …)'])
-        let w:vimb_hash_match = matchadd('VimbHash', '^\S\+', 20)
 
         setlocal scrollbind
         call win_execute(l:fw, 'setlocal scrollbind')
