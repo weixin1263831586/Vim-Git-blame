@@ -18,11 +18,11 @@ function! s:JobDone(token) abort
     call call(l:state.on_done, [l:exitval == 0, l:state.chunks])
 endfunction
 
-function! s:GitLinesAsync(cmd, on_done) abort
+function! s:GitLinesAsync(cmd, on_done, kind) abort
     let s:job_seq += 1
     let l:token = s:job_seq
     let s:jobs[l:token] = {'chunks': [], 'on_done': a:on_done, 'exitval': -1,
-                \ 'job': 0}
+                \ 'job': 0, 'kind': a:kind}
     " 注意 1：job_start() 对字符串命令不经 shell 执行，2>&1 等重定向会变成
     " 字面参数，必须显式走 sh -c。
     " 注意 2：exit_cb 触发时 out_cb 可能尚未派发完（大数据量竞态），
@@ -45,8 +45,30 @@ function! s:GitLinesAsync(cmd, on_done) abort
     return 1
 endfunction
 
-function! s:GitLines(cmd, on_done) abort
-    return s:async ? s:GitLinesAsync(a:cmd, a:on_done)
+" 停止指定类别的在途任务。先从表中移除再 job_stop()，即使 Vim 随后
+" 派发 close_cb，也只会命中 JobDone() 的 no-op 分支。
+function! s:CancelGitJobs(kind) abort
+    if !s:async
+        return
+    endif
+    for l:token in keys(copy(s:jobs))
+        if a:kind !=# '' && get(s:jobs[l:token], 'kind', '') !=# a:kind
+            continue
+        endif
+        let l:state = remove(s:jobs, l:token)
+        if type(get(l:state, 'job', 0)) != v:t_number
+            try
+                call job_stop(l:state.job)
+            catch
+                " 任务可能恰好自然退出；回调已经失效，无需额外处理。
+            endtry
+        endif
+    endfor
+endfunction
+
+function! s:GitLines(cmd, on_done, ...) abort
+    let l:kind = get(a:000, 0, '')
+    return s:async ? s:GitLinesAsync(a:cmd, a:on_done, l:kind)
                 \ : s:GitLinesSync(a:cmd, a:on_done)
 endfunction
 
@@ -110,4 +132,3 @@ function! s:ParseBlameLines(lines) abort
     endfor
     return l:records
 endfunction
-

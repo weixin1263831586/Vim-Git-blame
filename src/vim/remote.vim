@@ -39,7 +39,7 @@ function! s:CommitInfo() abort
                 \ 'Author   ' . get(l:record, 'author', '?')
                 \ . (empty(l:mail) ? '' : '  <' . l:mail . '>'),
                 \ 'Date     ' . l:date,
-                \ 'File     ' . (empty(s:stack) ? s:rel_path : s:stack[-1].path),
+                \ 'File     ' . s:RecordPath(l:record),
                 \ ]
     if get(l:record, 'previous', '') !=# ''
         call add(l:lines, 'Prev     ' . strpart(l:record.previous, 0, 12)

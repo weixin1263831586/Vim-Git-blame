@@ -7,6 +7,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vimb-install-test.XXXXXX")
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$WORK/mock-bin" "$WORK/install-bin"
+LOCAL_VERSION="v$("$ROOT/vimb" --version | sed 's/^vimb //')"
+LOCAL_SHA256=$(sha256sum "$ROOT/vimb" | awk '{print $1}')
 
 cat >"$WORK/mock-bin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -18,6 +20,9 @@ chmod 755 "$WORK/mock-bin/curl"
 run_installer() {
     env PATH="$WORK/mock-bin:$PATH" \
         VIMB_INSTALL_TEST_SOURCE="$1" \
+        VIMB_VERSION="$LOCAL_VERSION" \
+        VIMB_REF=local-test \
+        VIMB_SHA256="$LOCAL_SHA256" \
         BIN_DIR="$WORK/install-bin" \
         bash "$ROOT/install.sh"
 }
@@ -25,7 +30,7 @@ run_installer() {
 run_installer "$ROOT/vimb" >/dev/null
 cmp -s "$ROOT/vimb" "$WORK/install-bin/vimb"
 [ -x "$WORK/install-bin/vimb" ]
-[ "$("$WORK/install-bin/vimb" --version)" = 'vimb 2.3.0' ]
+[ "$("$WORK/install-bin/vimb" --version)" = "vimb ${LOCAL_VERSION#v}" ]
 
 cp "$ROOT/vimb" "$WORK/tampered-vimb"
 printf '\n# tampered\n' >>"$WORK/tampered-vimb"

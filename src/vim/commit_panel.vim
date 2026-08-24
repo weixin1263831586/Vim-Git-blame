@@ -1,19 +1,22 @@
 function! s:RenderCommit(record, file_only) abort
+    let l:path = s:RecordPath(a:record)
     let b:vimb_hash = a:record.hash
     let b:vimb_file_only = a:file_only
     let b:vimb_summary = get(a:record, 'summary', '')
+    let b:vimb_path = l:path
     let l:scope = a:file_only ? '仅此文件' : '全部文件'
     let l:title = 'vimb commit ' . a:record.hash . '  [' . l:scope . ']'
                 \ . '  f: 切换范围  q/Backspace/Ctrl-O: 返回 '
-                \ . fnamemodify(s:file_path, ':t')
+                \ . l:path
     let l:rule = repeat('-', min([100, max([40, &columns - 1])]))
     " 窗口先就位并显示占位内容，Git 结果就绪后再填充
     call s:ReplaceCurrentBuffer([l:title, l:rule, '', '(正在加载 commit …)'])
     normal! gg
     let s:commit_gen += 1
+    call s:CancelGitJobs('commit')
     let l:gen = s:commit_gen
     let l:cw = win_getid()
-    call s:LoadCommitLines(a:record.hash, a:file_only,
+    call s:LoadCommitLines(a:record.hash, a:file_only, l:path,
                 \ {ok, lines -> s:CommitRendered(ok, lines, l:gen, l:cw,
                 \     l:title, l:rule, get(a:record, 'summary', ''))})
     return 1
@@ -68,8 +71,11 @@ function! s:OpenCommitForRecord(record) abort
         call win_gotoid(l:cw)
     endif
 
-    " 同一个 commit 重复打开时保留已选的查看范围，新 commit 默认只看当前文件
-    let l:file_only = (get(b:, 'vimb_hash', '') ==# a:record.hash)
+    " 同一个 commit + 历史路径重复打开时保留查看范围；路径不同也必须重置，
+    " 否则 rename 两侧的同一提交会复用错误的文件范围。
+    let l:path = s:RecordPath(a:record)
+    let l:file_only = (get(b:, 'vimb_hash', '') ==# a:record.hash
+                \ && get(b:, 'vimb_path', '') ==# l:path)
                 \ ? get(b:, 'vimb_file_only', 1) : 1
     call s:RenderCommit(a:record, l:file_only)
 endfunction
@@ -109,7 +115,9 @@ function! s:ToggleCommitScope() abort
     if win_getid() != s:CommitWin() || !exists('b:vimb_hash')
         return
     endif
-    call s:RenderCommit({'hash': b:vimb_hash, 'summary': get(b:, 'vimb_summary', '')},
+    call s:RenderCommit({'hash': b:vimb_hash,
+                \ 'summary': get(b:, 'vimb_summary', ''),
+                \ 'path': get(b:, 'vimb_path', s:CurrentPath())},
                 \ !get(b:, 'vimb_file_only', 1))
 endfunction
 
@@ -140,6 +148,8 @@ function! s:ReturnToFile() abort
 endfunction
 
 function! s:CloseCommit(return_to_file) abort
+    let s:commit_gen += 1
+    call s:CancelGitJobs('commit')
     let l:cw = s:CommitWin()
     if l:cw
         let s:closing_commit = 1
@@ -163,4 +173,3 @@ function! s:CommitGone() abort
         call s:ReturnToFile()
     endif
 endfunction
-

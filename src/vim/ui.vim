@@ -58,6 +58,17 @@ function! s:FileLine() abort
     return s:captured_line
 endfunction
 
+function! s:ClipDisplayText(text, width) abort
+    let l:result = ''
+    for l:char in split(a:text, '\zs')
+        if strdisplaywidth(l:result . l:char . '…') > a:width
+            return l:result . '…'
+        endif
+        let l:result .= l:char
+    endfor
+    return l:result
+endfunction
+
 " current-line compact 模式：源窗口状态栏常驻当前行 commit 摘要
 function! s:UpdateCompactStatusline() abort
     let l:sw = s:SourceWin()
@@ -76,9 +87,9 @@ function! s:UpdateCompactStatusline() abort
             if get(l:record, 'author_time', 0) > 0
                 let l:info .= '  ' . strftime('%Y-%m-%d', l:record.author_time)
             endif
-            let l:info .= '  ' . strpart(
-                        \ substitute(get(l:record, 'summary', ''), '\s\+', ' ', 'g'),
-                        \ 0, 60)
+            let l:summary = substitute(get(l:record, 'summary', ''),
+                        \ '\s\+', ' ', 'g')
+            let l:info .= '  ' . s:ClipDisplayText(l:summary, 60)
         endif
     endif
     call win_execute(l:sw, 'let &l:statusline = ' . string(' vimb  ' . l:info))
@@ -265,4 +276,3 @@ function! s:ConfigureCommitBuffer() abort
         autocmd BufWipeout <buffer> call <SID>CommitGone()
     augroup END
 endfunction
-

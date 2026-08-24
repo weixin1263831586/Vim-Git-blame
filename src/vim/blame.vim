@@ -1,13 +1,14 @@
 function! s:BlameRequest(mode, notify) abort
     " mode: 'open' 首次打开 / 'refresh' 刷新 / 'push' 入栈 / 'pop' 出栈
     let s:blame_gen += 1
+    call s:CancelGitJobs('blame')
     let l:gen = s:blame_gen
     let l:bw = s:blame_winid
     let l:fw = s:source_winid
     let l:layer = s:stack[-1]
     call s:GitLines(s:BlameCmd(l:layer.commit, l:layer.path),
                 \ {ok, lines -> s:BlameLoaded(a:mode, a:notify, ok, lines,
-                \     l:gen, l:bw, l:fw)})
+                \     l:gen, l:bw, l:fw)}, 'blame')
 endfunction
 
 function! s:BlameLoaded(mode, notify, ok, lines, gen, bw, fw) abort
@@ -117,4 +118,3 @@ function! s:Refresh(notify) abort
     endif
     call s:BlameRequest('refresh', a:notify)
 endfunction
-

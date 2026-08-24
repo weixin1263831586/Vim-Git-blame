@@ -1,4 +1,5 @@
 function! s:CloseBlame() abort
+    call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let l:fw = s:SourceWin()
     " 先清历史栈把源窗口切回真实文件，再按真实文件视图恢复
@@ -29,6 +30,7 @@ function! s:CloseBlame() abort
 endfunction
 
 function! s:BlameGone() abort
+    call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let s:blame_winid = -1
     let s:blame_bufnr = -1
@@ -56,6 +58,7 @@ function! s:BlameGone() abort
 endfunction
 
 function! s:SourceGone() abort
+    call s:CancelGitJobs('')
     call s:InvalidateTrace()
     let s:closing_blame = 1
     try
@@ -70,6 +73,7 @@ function! s:SourceGone() abort
     let s:stack = [{'commit': '', 'path': s:rel_path, 'bufnr': s:file_bufnr,
                 \ 'records': [], 'line': 1, 'mtime': -1}]
     let s:src_bufs = {}
+    let s:src_cache_order = []
 endfunction
 
 function! s:AuxFocusWithoutSource() abort
@@ -107,4 +111,3 @@ function! s:Toggle() abort
         call s:OpenBlame()
     endif
 endfunction
-

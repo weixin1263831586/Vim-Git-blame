@@ -1,78 +1,113 @@
 " ---- blame 历史栈 ----------------------------------------------------------
-" P0 正确性：original_line 是子 commit 中的行号，不等于父 commit 中对应
-" 旧行的行号（父版本前后可能有插入/删除）。这里通过
-"   git diff --unified=0 <prev>:<prev_path> <cur>:<cur_path>
-" 的 hunk 头建立 child→parent 行映射；落在新增区（old_count == 0）的行
-" 是本 commit 首次引入，返回 -1（Tab 应提示而不是误追）。
-function! s:MapChildLineToParent(diff_lines, child_line) abort
-    let l:hunks = []
-    for l:raw in a:diff_lines
+" git line-log 会把目标 child 行窄化成它自己的 hunk，因此 mixed
+" insertion+replacement 也能得到可靠的 parent 行；old_count=0 才表示
+" 该逻辑行在 parent 中不存在。
+function! s:MapLineLogToParent(log_lines, child_line) abort
+    for l:raw in a:log_lines
         let l:m = matchlist(l:raw,
                     \ '^@@ -\(\d\+\)\%(,\(\d\+\)\)\? +\(\d\+\)\%(,\(\d\+\)\)\? @@')
         if !empty(l:m)
-            call add(l:hunks, {
-                        \ 'old_start': str2nr(l:m[1]),
-                        \ 'old_count': l:m[2] ==# '' ? 1 : str2nr(l:m[2]),
-                        \ 'new_start': str2nr(l:m[3]),
-                        \ 'new_count': l:m[4] ==# '' ? 1 : str2nr(l:m[4])})
+            let l:old_start = str2nr(l:m[1])
+            let l:old_count = l:m[2] ==# '' ? 1 : str2nr(l:m[2])
+            let l:new_start = str2nr(l:m[3])
+            let l:new_count = l:m[4] ==# '' ? 1 : str2nr(l:m[4])
+            if l:old_count == 0
+                return -1
+            endif
+            " 通常 line-log 已收窄为 1→1；保留相对索引作为兼容兜底。
+            let l:index = max([0, a:child_line - l:new_start])
+            return l:old_start + min([l:index, l:old_count - 1])
         endif
     endfor
-    if empty(l:hunks)
-        return a:child_line
-    endif
-    " new_start 已经是 child revision 的绝对行号；delta 只用于 hunk 之间
-    " 的未改动区，绝不能再次加到 new_start/new_end 上。
-    let l:delta = 0
-    for l:h in l:hunks
-        let l:child_end = l:h.new_start + l:h.new_count - 1
-        if a:child_line < l:h.new_start
-            return a:child_line - l:delta
-        endif
-        if l:h.new_count > 0 && a:child_line <= l:child_end
-            if l:h.old_count == 0
-                return -1   " 新增行：本 commit 首次引入
-            endif
-            let l:child_index = a:child_line - l:h.new_start
-            if l:child_index < min([l:h.old_count, l:h.new_count])
-                return l:h.old_start + l:child_index
-            endif
-            " replacement 中超出旧范围的 child 行也是本 commit 新增。
-            return -1
-        endif
-        let l:delta += l:h.new_count - l:h.old_count
-    endfor
-    return a:child_line - l:delta
+    return 0
 endfunction
 
-" 取子/父两个版本间的 diff hunk（异步）；回调 on_done(ok, parent_line, lines)
+" 让 Git 自己追踪目标行，而不是用 whole-file diff hunk header 猜映射。
+" 回调 on_done(ok, parent_line, lines)，parent_line=-1 表示首次引入。
 " parent_line == -1 表示该行为本 commit 新增
 function! s:ChildToParentLineAsync(child_commit, child_path, record, on_done) abort
-    let l:prev = a:record.previous
-    let l:prev_path = get(a:record, 'previous_path', '')
-    if l:prev_path ==# ''
-        let l:prev_path = a:child_path
-    endif
-    let l:cmd = s:GitBase() . ' diff --unified=0 '
-                \ . shellescape(l:prev . ':' . l:prev_path) . ' '
-                \ . shellescape(a:child_commit . ':' . a:child_path) . ' 2>&1'
+    let l:child_line = get(a:record, 'original_line', 1)
+    let l:range = l:child_line . ',' . l:child_line . ':' . a:child_path
+    let l:cmd = s:GitBase()
+                \ . ' log -1 --no-color --no-ext-diff --format= -L '
+                \ . shellescape(l:range) . ' ' . shellescape(a:child_commit)
+                \ . ' 2>&1'
     call s:GitLines(l:cmd, {ok, lines ->
-                \ call(a:on_done, [ok, s:MapChildLineToParent(lines,
-                \     get(a:record, 'original_line', 1)), lines])})
+                \ call(a:on_done, [ok,
+                \     ok ? s:MapLineLogToParent(lines, l:child_line) : 0,
+                \     lines])}, 'trace')
 endfunction
 
 " git show <commit>:<path> 异步读取文件内容；回调 on_done(ok, lines)
 function! s:GitShowFileAsync(commit, path, on_done) abort
     let l:cmd = s:GitBase()
                 \ . ' show ' . shellescape(a:commit . ':' . a:path) . ' 2>&1'
-    call s:GitLines(l:cmd, a:on_done)
+    call s:GitLines(l:cmd, a:on_done, 'trace')
 endfunction
 
 " 取历史版本缓冲区（懒创建并缓存）。同步读取已移除：内容由调用方经
 " GitShowFileAsync 取得后经 CreateSrcBuffer 落地。
+function! s:TouchSrcCache(key) abort
+    let l:index = index(s:src_cache_order, a:key)
+    if l:index >= 0
+        call remove(s:src_cache_order, l:index)
+    endif
+    call add(s:src_cache_order, a:key)
+endfunction
+
+function! s:CachedSrcBuffer(key) abort
+    if !has_key(s:src_bufs, a:key) || !bufexists(s:src_bufs[a:key])
+        if has_key(s:src_bufs, a:key)
+            call remove(s:src_bufs, a:key)
+        endif
+        let l:index = index(s:src_cache_order, a:key)
+        if l:index >= 0
+            call remove(s:src_cache_order, l:index)
+        endif
+        return -1
+    endif
+    call s:TouchSrcCache(a:key)
+    return s:src_bufs[a:key]
+endfunction
+
+" 只淘汰当前未显示的历史层；stack 的 commit/path/line 元数据继续保留，
+" 对应 records 一并释放，Backspace 返回时再异步 git show + blame。
+function! s:PruneSrcCache() abort
+    let l:current = empty(s:stack) ? -1 : s:stack[-1].bufnr
+    while len(s:src_cache_order) > s:history_cache_depth
+        let l:index = -1
+        for l:i in range(0, len(s:src_cache_order) - 1)
+            let l:key = s:src_cache_order[l:i]
+            if get(s:src_bufs, l:key, -1) != l:current
+                let l:index = l:i
+                break
+            endif
+        endfor
+        if l:index < 0
+            break
+        endif
+        let l:key = remove(s:src_cache_order, l:index)
+        if !has_key(s:src_bufs, l:key)
+            continue
+        endif
+        let l:bufnr = remove(s:src_bufs, l:key)
+        for l:layer in s:stack
+            if l:layer.commit . ':' . l:layer.path ==# l:key
+                let l:layer.bufnr = -1
+                let l:layer.records = []
+            endif
+        endfor
+        if bufexists(l:bufnr)
+            execute 'silent! bwipeout ' . l:bufnr
+        endif
+    endwhile
+endfunction
+
 function! s:CreateSrcBuffer(commit, path, lines) abort
     let l:key = a:commit . ':' . a:path
-    if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
-        return s:src_bufs[l:key]
+    let l:cached = s:CachedSrcBuffer(l:key)
+    if l:cached > 0
+        return l:cached
     endif
     let l:bufnr = bufadd('[vimb-src @' . strpart(a:commit, 0, 10) . ' '
                 \ . fnamemodify(a:path, ':t') . ']')
@@ -93,6 +128,7 @@ function! s:CreateSrcBuffer(commit, path, lines) abort
     endif
     call setbufvar(l:bufnr, 'vimb_src', 1)
     let s:src_bufs[l:key] = l:bufnr
+    call s:TouchSrcCache(l:key)
     return l:bufnr
 endfunction
 
@@ -191,6 +227,7 @@ endfunction
 function! s:InvalidateTrace() abort
     let s:trace_gen += 1
     let s:trace_busy = 0
+    call s:CancelGitJobs('trace')
 endfunction
 
 " diff 映射完成后：校验行号是否有效，再异步取父版本内容
@@ -216,8 +253,9 @@ function! s:PushOlderAfterMap(ok, parent_line, record, cur_layer, gen) abort
     endif
     " 已有缓存缓冲区可直接入栈；否则异步读取内容
     let l:key = l:prev . ':' . l:prev_path
-    if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
-        call s:FinishPush(l:prev, l:prev_path, s:src_bufs[l:key],
+    let l:cached = s:CachedSrcBuffer(l:key)
+    if l:cached > 0
+        call s:FinishPush(l:prev, l:prev_path, l:cached,
                     \ a:parent_line, a:cur_layer, a:gen)
         return
     endif
@@ -258,6 +296,8 @@ function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer, gen) abor
         call s:Error('源窗口已不存在，无法入栈')
         return
     endif
+    call s:TouchSrcCache(a:prev . ':' . a:prev_path)
+    call s:PruneSrcCache()
     let l:count = len(getbufline(a:bufnr, 1, '$'))
     call win_execute(l:sw,
                 \ 'call cursor(min([' . a:parent_line . ', ' . l:count . ']), 1)')
@@ -284,21 +324,54 @@ function! s:PopLayer(show_info) abort
     endif
     call remove(s:stack, -1)
     let l:layer = s:stack[-1]
+    if !empty(l:layer.commit) && (l:layer.bufnr <= 0
+                \ || !bufexists(l:layer.bufnr))
+        let s:trace_gen += 1
+        let s:trace_busy = 1
+        let l:gen = s:trace_gen
+        call s:Info('正在重新载入 ' . strpart(l:layer.commit, 0, 10) . ' …')
+        call s:GitShowFileAsync(l:layer.commit, l:layer.path,
+                    \ {ok, lines -> s:PopLayerReloaded(ok, lines, l:layer,
+                    \     a:show_info, l:gen)})
+        return
+    endif
+    call s:FinishPopLayer(l:layer, a:show_info)
+endfunction
+
+function! s:PopLayerReloaded(ok, lines, layer, show_info, gen) abort
+    if !s:TraceIsCurrent(a:gen, a:layer)
+        return
+    endif
+    if !a:ok
+        call s:FinishTrace(a:gen)
+        call s:Error('无法重新载入历史版本')
+        return
+    endif
+    let a:layer.bufnr = s:CreateSrcBuffer(a:layer.commit, a:layer.path, a:lines)
+    call s:FinishTrace(a:gen)
+    call s:FinishPopLayer(a:layer, a:show_info)
+endfunction
+
+function! s:FinishPopLayer(layer, show_info) abort
     let l:sw = s:SourceWin()
     if !l:sw
         return
     endif
-    call s:ShowLayerInSource(l:layer)
-    let l:count = len(getbufline(l:layer.bufnr, 1, '$'))
+    call s:ShowLayerInSource(a:layer)
+    if !empty(a:layer.commit)
+        call s:TouchSrcCache(a:layer.commit . ':' . a:layer.path)
+        call s:PruneSrcCache()
+    endif
+    let l:count = len(getbufline(a:layer.bufnr, 1, '$'))
     call win_execute(l:sw,
-                \ 'call cursor(min([' . l:layer.line . ', ' . l:count . ']), 1)')
+                \ 'call cursor(min([' . a:layer.line . ', ' . l:count . ']), 1)')
     call s:UpdateBlameStatusline()
     let l:bw = s:BlameWin()
     if !l:bw
         return
     endif
-    if !empty(l:layer.records)
-        if l:layer.commit ==# '' && getftime(s:file_path) != l:layer.mtime
+    if !empty(a:layer.records)
+        if a:layer.commit ==# '' && getftime(s:file_path) != a:layer.mtime
             " 工作区文件在追溯期间被改过，重新加载
             call s:BlameRequest('pop', 0)
         else
@@ -331,6 +404,7 @@ function! s:ClearStack() abort
         endif
     endfor
     let s:src_bufs = {}
+    let s:src_cache_order = []
 endfunction
 
 function! s:UpdateBlameStatusline() abort
@@ -346,4 +420,3 @@ function! s:UpdateBlameStatusline() abort
     call win_execute(l:bw, 'let &l:statusline = ' . string(' ' . l:depth
                 \ . '  |  Enter: commit  Tab: 追溯  BS: 返回  q: close '))
 endfunction
-

@@ -58,6 +58,15 @@ jobs:
           bash -n install.sh
           bash -n test/install.sh
           bash -n scripts/build.sh
+          bash -n scripts/verify-release-payload.sh
           ./vimb --version
-      - name: Test pinned installer and checksum verification
+      - name: Test installer checksum and version verification
         run: bash test/install.sh
+
+  release-payload:
+    name: Verify immutable release payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify installer default payload
+        run: bash scripts/verify-release-payload.sh

@@ -5,19 +5,29 @@ function! s:CurrentPath() abort
     return empty(s:stack) ? s:rel_path : s:stack[-1].path
 endfunction
 
-function! s:ShowCommitCmd(hash, file_only) abort
+" record 自带的路径属于该 commit 的历史坐标系；rename 之后它可能与当前
+" 栈顶路径不同。只有旧格式/合成 record 没有路径时才回退到当前路径。
+function! s:RecordPath(record) abort
+    let l:path = get(a:record, 'path', '')
+    if empty(l:path)
+        let l:path = get(a:record, 'filename', '')
+    endif
+    return empty(l:path) ? s:CurrentPath() : l:path
+endfunction
+
+function! s:ShowCommitCmd(hash, file_only, path) abort
     let l:cmd = s:GitBase()
                 \ . ' show --no-color --no-ext-diff --no-textconv'
                 \ . ' --format=fuller --decorate=no --stat --patch '
                 \ . shellescape(a:hash) . ' --'
     if a:file_only
-        let l:cmd .= ' ' . shellescape(s:CurrentPath())
+        let l:cmd .= ' ' . shellescape(a:path)
     endif
     return l:cmd . ' 2>&1'
 endfunction
 
-function! s:CommitCacheKey(hash, file_only) abort
-    return a:hash . (a:file_only ? '|file|' . s:CurrentPath() : '|all')
+function! s:CommitCacheKey(hash, file_only, path) abort
+    return a:hash . (a:file_only ? '|file|' . a:path : '|all')
 endfunction
 
 function! s:CommitLinesBytes(lines) abort
@@ -61,17 +71,17 @@ function! s:CacheCommit(key, lines, file_only) abort
     return 1
 endfunction
 
-function! s:LoadCommitLines(hash, file_only, on_done) abort
-    let l:key = s:CommitCacheKey(a:hash, a:file_only)
+function! s:LoadCommitLines(hash, file_only, path, on_done) abort
+    let l:key = s:CommitCacheKey(a:hash, a:file_only, a:path)
     if has_key(s:commit_cache, l:key)
         call s:TouchCommitCache(l:key)
         return call(a:on_done, [1, s:commit_cache[l:key].lines])
     endif
-    return s:GitLines(s:ShowCommitCmd(a:hash, a:file_only),
+    return s:GitLines(s:ShowCommitCmd(a:hash, a:file_only, a:path),
                 \ {ok, lines -> ok
                 \     ? s:CacheCommitThenCall(l:key, lines, a:file_only,
                 \         a:on_done)
-                \     : call(a:on_done, [ok, lines])})
+                \     : call(a:on_done, [ok, lines])}, 'commit')
 endfunction
 
 function! s:CacheCommitThenCall(key, lines, file_only, on_done) abort
@@ -150,4 +160,3 @@ function! s:PopulateBlame(records) abort
     call s:ReplaceCurrentBuffer(s:BlameDisplayLines(a:records))
     call s:DefineBlameSyntax(a:records)
 endfunction
-

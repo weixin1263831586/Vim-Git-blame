@@ -83,4 +83,3 @@ function! s:AgePattern(records, newest, bucket) abort
     endfor
     return join(l:parts, '\|')
 endfunction
-

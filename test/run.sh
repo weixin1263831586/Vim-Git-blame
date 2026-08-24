@@ -106,6 +106,29 @@ build_fixture() {
     with_env '2021-01-07T00:00:00' 'Bob Builder' 'bob@example.com' \
         commit -m 'two separate insertions'
 
+    # mixed hunk：同一个 hunk 同时插入一行并修改原目标行。whole-file
+    # header 是 1→2，只有 git log -L 能可靠识别 target_changed → target。
+    printf 'A\ntarget\nB\n' >"$FIXTURE/mixed_hunk.txt"
+    mgit add mixed_hunk.txt
+    with_env '2021-01-08T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'mixed hunk base'
+    printf 'A\ninserted\ntarget_changed\nB\n' >"$FIXTURE/mixed_hunk.txt"
+    mgit add mixed_hunk.txt
+    with_env '2021-01-09T00:00:00' 'Bob Builder' 'bob@example.com' \
+        commit -m 'mixed insert and modify'
+
+    # deep history：用于验证 source-buffer LRU 淘汰及 Backspace 懒加载。
+    printf 'deep 0\n' >"$FIXTURE/deep.txt"
+    mgit add deep.txt
+    with_env '2021-01-10T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'deep 0'
+    for n in 1 2 3; do
+        printf 'deep %s\n' "$n" >"$FIXTURE/deep.txt"
+        mgit add deep.txt
+        with_env "2021-01-$((10 + n))T00:00:00" 'Bob Builder' 'bob@example.com' \
+            commit -m "deep $n"
+    done
+
     # UTF-8 rename 场景：中文旧名 → 中文新名
     printf 'u line 1\nu line 2\n' >"$FIXTURE/旧文件.c"
     mgit add 旧文件.c
@@ -138,7 +161,7 @@ build_fixture() {
     printf 'ref one\nref two\n' >"$FIXTURE/refresh_target.txt"
     mgit add 中文文件名.txt 'file with spaces.txt' empty.txt crlf.txt refresh_target.txt
     with_env '2022-04-04T00:00:00' '张三丰' 'zhang@example.com' \
-        commit -m 'add edge case files'
+        commit -m 'X这是一个用于验证状态栏不会截断多字节字符的很长中文提交说明这是额外长度'
 
     # 大文件：20000 行，两个 commit
     seq 1 20000 | sed 's/^/line /' >"$FIXTURE/big.txt"
@@ -222,6 +245,7 @@ worktree:code.c:worktree.vim:
 rename:new_name.txt:rename.vim:
 big:big.txt:big.vim:
 enter:code.c:enter_commit.vim:
+rename_current_enter_commit:new_name.txt:rename_current_enter_commit.vim:
 refresh:refresh_target.txt:refresh.vim:
 toggle:code.c:toggle_restore.vim:noauto
 fold:code.c:fold.vim:noauto
@@ -230,17 +254,23 @@ stack:code.c:stack.vim:
 stack_rename:new_name.txt:stack_rename.vim:
 keys:code.c:keys.vim:
 history:code.c:history.vim:
+history_limit:deep.txt:history_limit.vim::VIMB_HISTORY_LIMIT=1
 history_interactive:code.c:history_interactive.vim:
+history_logical_line:old_commit_shift.txt:history_logical_line.vim:
 history_interactive_rename:new_name.txt:history_interactive_rename.vim:
+history_rename_enter_commit:new_name.txt:history_rename_enter_commit.vim:
 blameargs:code.c:blameargs.vim::VIMB_BLAME_ARGS=-w
 visual:code.c:visual.vim:
 stack_line_shift:shift.txt:stack_line_shift.vim:
 stack_new_line:shift.txt:stack_new_line.vim:
 stack_old_commit_shift:old_commit_shift.txt:stack_old_commit_shift.vim:
 stack_second_insertion:second_insertion.txt:stack_second_insertion.vim:
+stack_mixed_insert_modify:mixed_hunk.txt:stack_mixed_insert_modify.vim:
+history_cache_depth:deep.txt:history_cache_depth.vim::VIMB_HISTORY_CACHE_DEPTH=1
 stack_close_async_race:old_commit_shift.txt:stack_close_async_race.vim:
 stack_double_tab:old_commit_shift.txt:stack_double_tab.vim:
 statusline_quotes_restore:code.c:statusline_quotes_restore.vim:noauto
+statusline_utf8_summary:中文文件名.txt:statusline_utf8_summary.vim:
 visual_big_256:big.txt:visual_big_256.vim:noauto
 stack_utf8_rename:新文件.c:stack_utf8_rename.vim:
 history_close_race:code.c:history_close_race.vim:

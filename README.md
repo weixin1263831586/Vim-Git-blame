@@ -36,6 +36,12 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin12
 
 安装器会从不可变的发布 commit 下载 `vimb`，并校验内置 SHA-256；因此安装入口可以使用 `main`，实际安装内容不会随分支漂移。
 
+如果连安装器本身也要求固定不变，可使用当前已审计的不可变入口：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/de123d49bf5ef4f98d3ad6eff264d8f07e3cdcb6/install.sh | sh
+```
+
 或手动安装：
 
 ```bash
@@ -73,7 +79,7 @@ vimb -M -C <文件>       # 检测文件内移动 / 跨文件复制
 
 Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识别；Web 地址与 SSH 不同时，配置 `git config vimb.webBaseUrl https://gerrit.example.com` 或环境变量 `VIMB_WEB_BASE_URL`。
 
-环境变量 `VIMB_SYNC=1` 可强制使用同步 Git 调用（调试用）。
+环境变量 `VIMB_SYNC=1` 可强制使用同步 Git 调用（调试用）。历史源码缓冲区默认最多缓存 20 层，文件/行历史默认最多读取 500 条；可分别通过 `VIMB_HISTORY_CACHE_DEPTH` 和 `VIMB_HISTORY_LIMIT` 调整。
 
 ## 快捷键
 
@@ -104,6 +110,8 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 
 追溯历史（Tab）时，源窗口切换为对应历史版本的内容缓冲区（`[vimb-src @<hash>]`），blame 同步切换为对历史版本的 blame；每层的光标位置都会记录，Backspace 返回时精确恢复。
 
+History Explorer 的 Tab 会用 Git line-log 找到当前逻辑行的稳定身份，再在目标 revision 的 blame 中反查位置，因此目标行前方发生插入/删除时不会简单照搬数字行号。
+
 关闭 blame 后，文件的窗口选项（wrap、scrollbind）、缓冲区局部映射和视图位置都会恢复原状。
 
 ## 兼容性
@@ -118,7 +126,10 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 bash scripts/build.sh      # 从 src/ 重新生成单文件发布物 vimb
 bash test/run.sh          # 回归测试（异步路径）
 VIMB_SYNC=1 bash test/run.sh   # 同步路径再跑一遍
+bash scripts/verify-release-payload.sh  # 下载并验证安装器固定的发布物
 ```
+
+`src/vim/` 使用职责明确的语义化文件名；模块加载顺序只由 `scripts/build.sh` 的 `MODULES` 清单决定，不依赖目录遍历或文件名排序。构建脚本会拒绝缺失、重复以及未登记的 `.vim` 模块，避免新增文件被静默遗漏。所有模块最终拼进同一个 Vim script，共享 script-local (`s:`) 命名空间；当前依赖顺序为 `state → git → commit_cache → visual → ui → blame → stack → history → commit_panel → lifecycle → remote → bootstrap`。新增跨模块调用时，应确保提供者排在使用者之前，并同步更新 `MODULES` 清单。
 
 测试覆盖：普通文件、文件名含空格、中文文件名/作者显示宽度、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项/带引号状态栏/用户映射、syntax off 保持、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**blame revision 坐标映射**/**多 hunk 映射**/**新增行拦截**/**Tab 关闭与双击竞态**、快捷键与 URL 构造（含 Gerrit SSH 远端）、交互式文件/行历史（含 rename 旧路径 revision）、历史层行历史、异步关闭竞态、blame 附加参数、256 色大文件视觉路径、CLI `--` 解析。
 

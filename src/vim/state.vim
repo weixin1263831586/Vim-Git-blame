@@ -48,6 +48,11 @@ let s:source_winid = win_getid()
 let s:stack = [{'commit': '', 'path': s:rel_path, 'bufnr': s:file_bufnr,
             \ 'records': [], 'line': 1, 'mtime': -1}]
 let s:src_bufs = {}   " 'commit:path' → 历史版本 nofile 缓冲区号
+let s:src_cache_order = []
+let s:history_cache_depth = $VIMB_HISTORY_CACHE_DEPTH =~# '^\d\+$'
+            \ ? max([1, str2nr($VIMB_HISTORY_CACHE_DEPTH)]) : 20
+let s:history_limit = $VIMB_HISTORY_LIMIT =~# '^\d\+$'
+            \ ? max([1, str2nr($VIMB_HISTORY_LIMIT)]) : 500
 let s:blame_bufnr = -1
 let s:blame_winid = -1
 let s:commit_bufnr = -1
@@ -189,4 +194,3 @@ function! s:GitFailure(lines) abort
     let l:text = substitute(join(a:lines, ' '), '\s\+', ' ', 'g')
     return empty(l:text) ? 'Git 命令执行失败' : strpart(l:text, 0, 240)
 endfunction
-
