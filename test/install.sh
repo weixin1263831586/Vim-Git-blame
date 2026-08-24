@@ -37,9 +37,10 @@ fi
 if env PATH="$WORK/mock-bin:$PATH" \
         VIMB_INSTALL_TEST_SOURCE="$ROOT/vimb" \
         VIMB_VERSION=v9.9.9 \
+        VIMB_REF=test-ref \
         BIN_DIR="$WORK/install-bin" \
         bash "$ROOT/install.sh" >/dev/null 2>&1; then
-    printf 'FAIL installer accepted a custom version without VIMB_SHA256\n' >&2
+    printf 'FAIL installer accepted a custom version/ref without VIMB_SHA256\n' >&2
     exit 1
 fi
 

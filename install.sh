@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # vimb 安装脚本：从 GitHub 下载 vimb 并安装到 ~/.local/bin
 # 用法: curl --proto '=https' --tlsv1.2 -fsSL \
-#       https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/v2.3.0/install.sh | sh
+#       https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
 # 可通过 BIN_DIR 环境变量覆盖安装目录，例如: BIN_DIR=/usr/local/bin sh install.sh
-# 校验测试自定义版本时需同时传 VIMB_VERSION 与对应的 VIMB_SHA256。
+# 默认从不可变 commit 下载；测试自定义来源时需同时传 VIMB_VERSION、
+# VIMB_REF 与对应的 VIMB_SHA256。
 
 set -eu
 
@@ -11,13 +12,15 @@ msg() { printf 'vimb-installer: %s\n' "$*"; }
 die() { printf 'vimb-installer: %s\n' "$*" >&2; exit 1; }
 
 DEFAULT_VERSION="v2.3.0"
+DEFAULT_REF="4d89b09214dc1bcc59d031b9a6e8214fced29ab4"
 DEFAULT_SHA256="eabdf3a3529c570e8dcac82c6bed26b898ba3392e5294cf46d5bb695247118c2"
 VIMB_VERSION="${VIMB_VERSION:-$DEFAULT_VERSION}"
-if [ "$VIMB_VERSION" = "$DEFAULT_VERSION" ]; then
+VIMB_REF="${VIMB_REF:-$DEFAULT_REF}"
+if [ "$VIMB_VERSION" = "$DEFAULT_VERSION" ] && [ "$VIMB_REF" = "$DEFAULT_REF" ]; then
     EXPECTED_SHA256="${VIMB_SHA256:-$DEFAULT_SHA256}"
 else
     [ -n "${VIMB_SHA256:-}" ] \
-        || die "自定义 VIMB_VERSION 时必须同时提供 VIMB_SHA256"
+        || die "自定义 VIMB_VERSION/VIMB_REF 时必须同时提供 VIMB_SHA256"
     EXPECTED_SHA256=$VIMB_SHA256
 fi
 case "$EXPECTED_SHA256" in
@@ -25,7 +28,7 @@ case "$EXPECTED_SHA256" in
 esac
 [ "${#EXPECTED_SHA256}" -eq 64 ] || die "VIMB_SHA256 长度必须为 64"
 
-REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/$VIMB_VERSION"
+REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/$VIMB_REF"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \

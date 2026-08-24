@@ -31,8 +31,10 @@
 一键安装（依赖 `curl` 或 `wget`）：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/v2.3.0/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
 ```
+
+安装器会从不可变的发布 commit 下载 `vimb`，并校验内置 SHA-256；因此安装入口可以使用 `main`，实际安装内容不会随分支漂移。
 
 或手动安装：
 
