@@ -2,7 +2,7 @@
 
 一个小巧、可预期的 Vim Git 代码历史追溯（Code Archaeology）工作区。一条命令 `vimb <文件>` 启动：左侧逐行 blame、双向光标同步、单击查看 commit patch，还能用 Tab 逐层向前追溯一行的历史来源，直到最初引入它的提交。
 
-单个 Bash 脚本实现，除 `vim` 和 `git` 外无任何依赖。
+发布物仍是单个 Bash 脚本，除 `vim` 和 `git` 外无任何运行时依赖；开发源码按职责拆分在 `src/`，由构建脚本生成 `vimb`。
 
 ## 功能
 
@@ -11,9 +11,9 @@
 - 当前行的 commit 自动高亮，同属一个 commit 的所有行一起标出
 - 鼠标单击或 Enter 查看该行所属 commit 的完整信息（fuller 格式 + stat + patch）
 - **Tab 向前追溯**：基于 `previous` 字段入栈显示历史版本文件，rename/移动过的代码自动跟随旧路径；Backspace 逐层返回，blame 栏显示当前深度（如 `vimb blame 2 层 @79583ef`）
-- blame 视觉增强：连续相同 commit 的行合并显示（块首行显示作者/日期）、相邻 commit 块循环底色区分（256 色终端）、commit 年龄热力（hash 列按新旧绿→蓝→灰着色）
+- blame 视觉增强：连续相同 commit 的行合并显示（块首行显示作者/日期）、相邻 commit 块循环底色区分（256 色终端）、按当前时间计算的代码年龄热力（hash 列按新旧绿→蓝→灰着色）
 - 源窗口状态栏常驻显示当前行 commit 摘要（current-line compact 模式），关闭 blame 后恢复
-- `gh` 文件历史（`git log --follow`，rename 后继续追溯）；`gl` 当前行历史（`git log -L`）
+- `gh` 文件历史（`git log --follow`，rename 后继续追溯）；`gl` 当前行历史（`git log -L`）；历史记录支持 Enter 查看 commit、y 复制 SHA、o 浏览器打开、Tab 直接进入所选 revision
 - `i` 轻量 commit 信息 popup（作者/日期/previous，纯内存零 Git 调用）
 - `y` 复制完整 commit SHA（尽力同步系统剪贴板）
 - `o` 在浏览器打开 commit（支持 GitHub / GitLab / Gitee / Bitbucket / Sourcehut / Gerrit）
@@ -31,7 +31,7 @@
 一键安装（依赖 `curl` 或 `wget`）：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/v2.3.0/install.sh | sh
 ```
 
 或手动安装：
@@ -79,13 +79,15 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 | --- | --- | --- |
 | 鼠标单击 / Enter | blame 栏或文件 | 查看该行所属 commit |
 | Tab | blame 栏或文件 | 追溯该行到引入它的上一版（入栈，跟随 rename） |
+| Tab | history commit 行 | 进入所选 revision（跟随当时路径） |
 | Backspace | blame 栏或文件 | 返回较新版本（出栈） |
 | i | blame 栏或文件 | 轻量 commit 信息 popup |
-| y | 任意位置 | 复制当前 commit SHA |
-| o | 任意位置 | 在浏览器打开 commit |
+| y | blame / 文件 / commit / history commit 行 | 复制当前 commit SHA |
+| o | blame / 文件 / commit / history commit 行 | 在浏览器打开 commit |
 | f | commit 视图 | 切换 仅此文件 / 全部文件 |
 | gh | blame 栏或文件 | 文件历史（跟随 rename） |
 | gl | blame 栏或文件 | 当前行历史（git log -L） |
+| Enter | history commit 行 | 打开所选 commit |
 | q / Backspace / Ctrl-O | commit 视图 | 返回原文件 |
 | q / Ctrl-C | blame 栏 | 关闭 blame |
 | gb | 任意位置 | 显示或隐藏 blame |
@@ -104,18 +106,21 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 
 ## 兼容性
 
-- 依赖：`vim`（建议 8.2+，需 `+job` 以启用异步；无此特性自动退回同步）、`git`
+- 依赖：`vim`（8.2.1119+；需 `+job` 以启用异步，无此特性自动退回同步）、`git`
 - `o` 键需要 `xdg-open`（Linux）或 `open`（macOS）
 - 平台：Linux；脚本路径解析使用 `readlink -f` → `realpath` → 纯 bash 归一化三级回退，不依赖 GNU 专有参数
 
 ## 开发
 
 ```bash
+bash scripts/build.sh      # 从 src/ 重新生成单文件发布物 vimb
 bash test/run.sh          # 回归测试（异步路径）
 VIMB_SYNC=1 bash test/run.sh   # 同步路径再跑一遍
 ```
 
-测试覆盖：普通文件、文件名含空格、中文文件名、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项与用户映射、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**父版本行号偏移映射**/**新增行拦截**、快捷键与 URL 构造（含 Gerrit SSH 远端）、文件/行历史面板、历史层行历史、异步关闭竞态、blame 附加参数、视觉增强、CLI `--` 解析。
+测试覆盖：普通文件、文件名含空格、中文文件名/作者显示宽度、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项/带引号状态栏/用户映射、syntax off 保持、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**blame revision 坐标映射**/**多 hunk 映射**/**新增行拦截**/**Tab 关闭与双击竞态**、快捷键与 URL 构造（含 Gerrit SSH 远端）、交互式文件/行历史（含 rename 旧路径 revision）、历史层行历史、异步关闭竞态、blame 附加参数、256 色大文件视觉路径、CLI `--` 解析。
+
+CI 会验证 Vim 8.2.1119、Vim 9.0 与最新稳定版，并组合覆盖异步/同步 Git 路径及低色彩/256 色终端；构建后还会确认 `vimb` 与 `src/` 完全一致。
 
 ## 许可
 

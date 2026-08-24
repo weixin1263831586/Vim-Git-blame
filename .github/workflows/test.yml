@@ -7,19 +7,57 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vim-version: v8.2.1119
+            git-mode: async
+            vimb-sync: '0'
+            term: xterm
+          - vim-version: v8.2.1119
+            git-mode: sync
+            vimb-sync: '1'
+            term: xterm-256color
+          - vim-version: v9.0.0000
+            git-mode: async
+            vimb-sync: '0'
+            term: xterm-256color
+          - vim-version: stable
+            git-mode: async
+            vimb-sync: '0'
+            term: xterm
+          - vim-version: stable
+            git-mode: sync
+            vimb-sync: '1'
+            term: xterm-256color
+    name: Vim ${{ matrix.vim-version }} / ${{ matrix.git-mode }} / ${{ matrix.term }}
+    env:
+      TERM: ${{ matrix.term }}
+      VIMB_SYNC: ${{ matrix.vimb-sync }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          version: ${{ matrix.vim-version }}
+      - name: Install Git
         run: |
           sudo apt-get update
-          sudo apt-get install -y vim git
+          sudo apt-get install -y git
+      - name: Show tool versions
+        run: |
+          vim --version | head -5
+          git --version
       - name: Run regression tests
         run: bash test/run.sh
-      - name: Run regression tests (sync git path)
-        env:
-          VIMB_SYNC: '1'
-        run: bash test/run.sh
+      - name: Verify generated single-file distribution
+        run: ./scripts/build.sh --check
       - name: Check script syntax
         run: |
           bash -n vimb
+          bash -n install.sh
+          bash -n test/install.sh
+          bash -n scripts/build.sh
           ./vimb --version
+      - name: Test pinned installer and checksum verification
+        run: bash test/install.sh

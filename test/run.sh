@@ -79,6 +79,33 @@ build_fixture() {
     with_env '2021-01-02T00:00:00' 'Bob Builder' 'bob@example.com' \
         commit -m 'shift insert head'
 
+    # old-commit-shift：被 blame 的 A 提交之后，B 又在目标行前插入内容。
+    # original_line 属于 A 坐标系，不能拿它去映射 P → HEAD。
+    printf 'a\ntarget\nz\n' >"$FIXTURE/old_commit_shift.txt"
+    mgit add old_commit_shift.txt
+    with_env '2021-01-03T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'old shift base'
+    printf 'a\ntarget changed\nz\n' >"$FIXTURE/old_commit_shift.txt"
+    mgit add old_commit_shift.txt
+    with_env '2021-01-04T00:00:00' 'Bob Builder' 'bob@example.com' \
+        commit -m 'old shift modify target'
+    printf 'new before\na\ntarget changed\nz\n' >"$FIXTURE/old_commit_shift.txt"
+    mgit add old_commit_shift.txt
+    with_env '2021-01-05T00:00:00' 'Carol Changer' 'carol@example.com' \
+        commit -m 'old shift later insertion'
+
+    # second-insertion：同一 commit 的第二个纯插入 hunk，new_start 已包含
+    # 第一个 hunk 的偏移，映射算法不得再次把累计 delta 加到 new_start。
+    printf 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n' >"$FIXTURE/second_insertion.txt"
+    mgit add second_insertion.txt
+    with_env '2021-01-06T00:00:00' 'Alice Author' 'alice@example.com' \
+        commit -m 'second insertion base'
+    printf 'NEW1\na\nb\nc\nd\ne\nf\ng\nh\nNEW2\ni\nj\n' \
+        >"$FIXTURE/second_insertion.txt"
+    mgit add second_insertion.txt
+    with_env '2021-01-07T00:00:00' 'Bob Builder' 'bob@example.com' \
+        commit -m 'two separate insertions'
+
     # UTF-8 rename 场景：中文旧名 → 中文新名
     printf 'u line 1\nu line 2\n' >"$FIXTURE/旧文件.c"
     mgit add 旧文件.c
@@ -103,15 +130,15 @@ build_fixture() {
     git -C "$WORK/gerrit-repo" remote add origin \
         ssh://huang@gerrit.example.com:29418/platform/frameworks/base
 
-    # 各种边界文件
+    # 各种边界文件（中文文件的作者为中文，作作者列显示宽度对齐回归）
     printf '中文一\n中文二\n' >"$FIXTURE/中文文件名.txt"
     printf 'sp one\nsp two\n' >"$FIXTURE/file with spaces.txt"
     : >"$FIXTURE/empty.txt"
     printf 'crlf one\r\ncrlf two\r\n' >"$FIXTURE/crlf.txt"
     printf 'ref one\nref two\n' >"$FIXTURE/refresh_target.txt"
     mgit add 中文文件名.txt 'file with spaces.txt' empty.txt crlf.txt refresh_target.txt
-    with_env '2022-04-04T00:00:00' 'Alice Author' 'alice@example.com' \
-        commit -q -m 'add edge case files'
+    with_env '2022-04-04T00:00:00' '张三丰' 'zhang@example.com' \
+        commit -m 'add edge case files'
 
     # 大文件：20000 行，两个 commit
     seq 1 20000 | sed 's/^/line /' >"$FIXTURE/big.txt"
@@ -188,6 +215,7 @@ so $CASES_DIR/$script")
 ALL_CASES='basic:code.c:basic.vim:
 spaces:file with spaces.txt:spaces.vim:
 utf8:中文文件名.txt:utf8.vim:
+utf8_align:中文文件名.txt:utf8_align.vim:
 empty:empty.txt:empty.vim:
 crlf:crlf.txt:crlf.vim:
 worktree:code.c:worktree.vim:
@@ -202,10 +230,18 @@ stack:code.c:stack.vim:
 stack_rename:new_name.txt:stack_rename.vim:
 keys:code.c:keys.vim:
 history:code.c:history.vim:
+history_interactive:code.c:history_interactive.vim:
+history_interactive_rename:new_name.txt:history_interactive_rename.vim:
 blameargs:code.c:blameargs.vim::VIMB_BLAME_ARGS=-w
 visual:code.c:visual.vim:
 stack_line_shift:shift.txt:stack_line_shift.vim:
 stack_new_line:shift.txt:stack_new_line.vim:
+stack_old_commit_shift:old_commit_shift.txt:stack_old_commit_shift.vim:
+stack_second_insertion:second_insertion.txt:stack_second_insertion.vim:
+stack_close_async_race:old_commit_shift.txt:stack_close_async_race.vim:
+stack_double_tab:old_commit_shift.txt:stack_double_tab.vim:
+statusline_quotes_restore:code.c:statusline_quotes_restore.vim:noauto
+visual_big_256:big.txt:visual_big_256.vim:noauto
 stack_utf8_rename:新文件.c:stack_utf8_rename.vim:
 history_close_race:code.c:history_close_race.vim:
 line_history_stack:code.c:line_history_stack.vim:

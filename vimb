@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="2.2.1"
+VERSION="2.3.0"
 
 usage() {
     cat <<'EOF'
@@ -174,11 +174,8 @@ highlight default VimbAge2 ctermfg=4 guifg=#0087af
 highlight default VimbAge3 ctermfg=8 guifg=#808080
 highlight default link VimbHash Comment
 
-" per-commit 配色块用语法项实现（matchaddpos 每项最多 8 个位置，大块会爆量），
-" 需要语法引擎开启；不影响未设置 filetype 的文件缓冲区
-if has('syntax') && !exists('g:syntax_on')
-    syntax enable
-endif
+" blame 缓冲区会直接定义自己的 buffer-local 语法项，不改变用户全局的
+" syntax on/off 状态。
 
 let s:git_root = $VIMB_GIT_ROOT
 let s:rel_path = $VIMB_REL_PATH
@@ -211,6 +208,12 @@ let s:job_seq = 0
 let s:blame_gen = 0
 let s:commit_gen = 0
 let s:commit_cache = {}
+let s:commit_cache_order = []
+let s:commit_cache_bytes = 0
+let s:commit_cache_max_bytes = 5 * 1024 * 1024
+let s:commit_cache_entry_max_bytes = 2 * 1024 * 1024
+let s:trace_gen = 0
+let s:trace_busy = 0
 
 " Git 对非 ASCII / 特殊字符路径默认输出 C-style quoting（"\344\270..."），
 " 统一加 -c core.quotePath=false 让 blame/diff/show 输出明文路径，
@@ -462,27 +465,62 @@ function! s:CommitCacheKey(hash, file_only) abort
     return a:hash . (a:file_only ? '|file|' . s:CurrentPath() : '|all')
 endfunction
 
-function! s:CacheCommit(key, lines) abort
-    let s:commit_cache[a:key] = a:lines
-    " FIFO 淘汰：最多保留 10 条 commit 渲染结果
-    while len(s:commit_cache) > 10
-        call remove(s:commit_cache, keys(s:commit_cache)[0])
+function! s:CommitLinesBytes(lines) abort
+    let l:bytes = 0
+    for l:line in a:lines
+        let l:bytes += strlen(l:line) + 1
+    endfor
+    return l:bytes
+endfunction
+
+function! s:TouchCommitCache(key) abort
+    let l:index = index(s:commit_cache_order, a:key)
+    if l:index >= 0
+        call remove(s:commit_cache_order, l:index)
+    endif
+    call add(s:commit_cache_order, a:key)
+endfunction
+
+function! s:CacheCommit(key, lines, file_only) abort
+    let l:bytes = s:CommitLinesBytes(a:lines)
+    " all-files patch 很容易达到数十 MB；大结果只渲染、不缓存。单文件结果
+    " 也不能超过总缓存上限，避免一次提交挤爆 Vim 内存。
+    if (!a:file_only && (len(a:lines) > 5000
+                \ || l:bytes > s:commit_cache_entry_max_bytes))
+                \ || l:bytes > s:commit_cache_max_bytes
+        return 0
+    endif
+    if has_key(s:commit_cache, a:key)
+        let s:commit_cache_bytes -= s:commit_cache[a:key].bytes
+    endif
+    let s:commit_cache[a:key] = {'lines': a:lines, 'bytes': l:bytes}
+    let s:commit_cache_bytes += l:bytes
+    call s:TouchCommitCache(a:key)
+    " 明确的 LRU 顺序 + 总字节上限，条目数上限仅作第二道保护。
+    while len(s:commit_cache_order) > 10
+                \ || s:commit_cache_bytes > s:commit_cache_max_bytes
+        let l:oldest = remove(s:commit_cache_order, 0)
+        let s:commit_cache_bytes -= s:commit_cache[l:oldest].bytes
+        call remove(s:commit_cache, l:oldest)
     endwhile
+    return 1
 endfunction
 
 function! s:LoadCommitLines(hash, file_only, on_done) abort
     let l:key = s:CommitCacheKey(a:hash, a:file_only)
     if has_key(s:commit_cache, l:key)
-        return call(a:on_done, [1, s:commit_cache[l:key]])
+        call s:TouchCommitCache(l:key)
+        return call(a:on_done, [1, s:commit_cache[l:key].lines])
     endif
     return s:GitLines(s:ShowCommitCmd(a:hash, a:file_only),
                 \ {ok, lines -> ok
-                \     ? s:CacheCommitThenCall(l:key, lines, a:on_done)
+                \     ? s:CacheCommitThenCall(l:key, lines, a:file_only,
+                \         a:on_done)
                 \     : call(a:on_done, [ok, lines])})
 endfunction
 
-function! s:CacheCommitThenCall(key, lines, on_done) abort
-    call s:CacheCommit(a:key, a:lines)
+function! s:CacheCommitThenCall(key, lines, file_only, on_done) abort
+    call s:CacheCommit(a:key, a:lines, a:file_only)
     return call(a:on_done, [1, a:lines])
 endfunction
 
@@ -522,8 +560,12 @@ function! s:BlameDisplayLines(records) abort
                     \     ? strftime('%Y-%m-%d', l:record.author_time)
                     \     : '----------')
         let l:author = l:compact ? '' : get(l:record, 'author', '?')
-        call add(l:lines, printf('%-10s %-12s %-10s %*d',
-                    \ l:hash, l:author, l:date, l:number_width,
+        " 作者列必须按显示宽度填充：printf %-12s 按字节填充，中文等
+        " 宽字符作者的日期/行号列会整体左移错位；hash/日期恒为 ASCII
+        let l:prefix = printf('%-10s ', l:hash)
+                    \ . s:ClipAndPad(l:author, 12) . ' '
+                    \ . printf('%-10s ', l:date)
+        call add(l:lines, l:prefix . printf('%*d', l:number_width,
                     \ get(l:record, 'final_line', len(l:lines) + 1)))
         let l:last_hash = l:record.hash
     endfor
@@ -554,14 +596,14 @@ function! s:PopulateBlame(records) abort
     call s:DefineBlameSyntax(a:records)
 endfunction
 
-" ---- v2.4 视觉：per-commit 配色块 + commit 年龄热力 ------------------------
-" 年龄分档：相对 records 中最新提交的间隔天数
+" ---- 视觉：per-commit 配色块 + commit 年龄热力 -----------------------------
+" 年龄分档：相对当前时间的实际代码年龄
 "   0: 30 天内(亮绿)  1: 1 年内(绿)  2: 3 年内(蓝)  3: 更早(灰)
-function! s:AgeBucket(author_time, newest) abort
-    if a:author_time <= 0 || a:newest <= 0
+function! s:AgeBucket(author_time, now) abort
+    if a:author_time <= 0 || a:now <= 0
         return 3
     endif
-    let l:days = (a:newest - a:author_time) / 86400
+    let l:days = max([0, (a:now - a:author_time) / 86400])
     if l:days <= 30
         return 0
     elseif l:days <= 365
@@ -574,18 +616,16 @@ endfunction
 
 function! s:DefineBlameSyntax(records) abort
     " 年龄热力（hash 列前景色）任何终端都开；per-commit 色块需要 256 色
-    let l:newest = 0
-    for l:record in a:records
-        if get(l:record, 'author_time', 0) > l:newest
-            let l:newest = l:record.author_time
-        endif
-    endfor
+    if !has('syntax')
+        return
+    endif
+    let l:now = localtime()
     syntax clear
     unlet! b:current_syntax
-    if !(has('syntax') && (has('gui_running') || &t_Co >= 256))
+    if !(has('gui_running') || &t_Co >= 256)
         " 低色彩终端：仅年龄热力
         for l:bucket in range(4)
-            let l:pat = s:AgePattern(a:records, l:newest, l:bucket)
+            let l:pat = s:AgePattern(a:records, l:now, l:bucket)
             if !empty(l:pat)
                 execute 'syntax match VimbAge' . l:bucket . ' /\%(' . l:pat
                             \ . '\)\%10c/ containedin=ALL'
@@ -593,27 +633,36 @@ function! s:DefineBlameSyntax(records) abort
         endfor
         return
     endif
-    " 相邻 commit 块循环 4 色：按块序取模
+    " 相邻 commit 块循环 4 色：每个连续块只创建一个 region，而不是逐行
+    " 创建。大文件的语法项数量由 O(lines) 降为 O(commit blocks)。
     let l:block = 0
     let l:last_hash = ''
+    let l:block_start = 0
+    let l:index = 0
     for l:record in a:records
+        let l:index += 1
         if l:record.hash !=# l:last_hash
+            if l:block_start > 0
+                call s:DefineBlameBlock(l:block, l:block_start, l:index - 1)
+            endif
             let l:block += 1
             let l:last_hash = l:record.hash
-        endif
-        let l:group = 'VimbC' . (l:block % 4)
-        let l:line = get(l:record, 'final_line', 0)
-        if l:line > 0
-            execute 'syntax region ' . l:group . ' start=/\%' . l:line
-                        \ . 'l\%^/ end=/\%' . l:line . 'l\%$/'
-        endif
-        " 块首行 hash 列按年龄着色（region 只盖底色，前景让给年龄组）
-        if l:record.hash !=# get(get(a:records, l:line - 2, {}), 'hash', '')
-            let l:bucket = s:AgeBucket(get(l:record, 'author_time', 0), l:newest)
-            let l:age_pat = '\%' . l:line . 'l\%1c\S\+\%10c'
+            let l:block_start = l:index
+            " 块首行 hash 列按实际年龄着色（region 只盖底色）
+            let l:bucket = s:AgeBucket(get(l:record, 'author_time', 0), l:now)
+            let l:age_pat = '\%' . l:index . 'l\%1c\S\+\%10c'
             execute 'syntax match VimbAge' . l:bucket . ' /' . l:age_pat . '/'
         endif
     endfor
+    if l:block_start > 0
+        call s:DefineBlameBlock(l:block, l:block_start, l:index)
+    endif
+endfunction
+
+function! s:DefineBlameBlock(block, first, last) abort
+    let l:group = 'VimbC' . (a:block % 4)
+    execute 'syntax region ' . l:group . ' start=/\%' . a:first
+                \ . 'l\%^/ end=/\%' . a:last . 'l\%$/'
 endfunction
 
 " 生成某年龄档所有块首行 hash 列的匹配模式（低色彩终端用）
@@ -817,8 +866,7 @@ function! s:DeactivateFile() abort
         let l:statusline = get(s:file_options, 'statusline', '')
         call win_execute(l:fw, 'let &l:wrap = ' . l:wrap
                     \ . ' | let &l:scrollbind = ' . l:scrollbind)
-        call win_execute(l:fw, 'let &l:statusline = '
-                    \ . string(substitute(l:statusline, "'", "''", 'g')))
+        call win_execute(l:fw, 'let &l:statusline = ' . string(l:statusline))
         call win_execute(l:fw, 'VimbRestoreFileMaps')
     endif
     let s:file_options = {}
@@ -1044,28 +1092,28 @@ function! s:MapChildLineToParent(diff_lines, child_line) abort
     if empty(l:hunks)
         return a:child_line
     endif
-    " 行号偏移累计：child_line = parent_line + offset（相邻 hunk 之间）
-    let l:offset = 0
+    " new_start 已经是 child revision 的绝对行号；delta 只用于 hunk 之间
+    " 的未改动区，绝不能再次加到 new_start/new_end 上。
+    let l:delta = 0
     for l:h in l:hunks
         let l:child_end = l:h.new_start + l:h.new_count - 1
-        if a:child_line < l:h.new_start + l:offset
-            " 位于该 hunk 之前的未改动区：parent = child - offset
-            return a:child_line - l:offset
+        if a:child_line < l:h.new_start
+            return a:child_line - l:delta
         endif
-        if a:child_line <= l:child_end + l:offset
-            " 位于本 hunk 改动区内
+        if l:h.new_count > 0 && a:child_line <= l:child_end
             if l:h.old_count == 0
                 return -1   " 新增行：本 commit 首次引入
             endif
-            return l:h.old_start + (a:child_line - l:offset - l:h.new_start)
+            let l:child_index = a:child_line - l:h.new_start
+            if l:child_index < min([l:h.old_count, l:h.new_count])
+                return l:h.old_start + l:child_index
+            endif
+            " replacement 中超出旧范围的 child 行也是本 commit 新增。
+            return -1
         endif
-        " hunk 之后：更新偏移继续找
-        let l:offset += l:h.new_count - l:h.old_count
-        if l:offset < 0
-            let l:offset = 0
-        endif
+        let l:delta += l:h.new_count - l:h.old_count
     endfor
-    return a:child_line - l:offset
+    return a:child_line - l:delta
 endfunction
 
 " 取子/父两个版本间的 diff hunk（异步）；回调 on_done(ok, parent_line, lines)
@@ -1178,27 +1226,57 @@ function! s:PushOlder() abort
         call s:Info('该行已追溯到最早引入它的提交（boundary）')
         return
     endif
-    let l:cur_layer = s:stack[-1]
-    let l:child_commit = l:cur_layer.commit
-    let l:child_path = l:cur_layer.path
-    if l:child_commit ==# ''
-        " 工作区层：以 HEAD 上的该文件为子版本做 diff
-        let l:child_commit = 'HEAD'
+    if s:trace_busy
+        call s:Info('正在追溯，请稍候 …')
+        return
     endif
+    let l:cur_layer = s:stack[-1]
+    " original_line 属于 blame record.hash 的坐标系；child revision/path 必须
+    " 与它一致，不能用栈顶 HEAD/commit（其后提交可能已在目标行前增删内容）。
+    let l:child_commit = l:record.hash
+    let l:child_path = get(l:record, 'filename', '')
+    if l:child_path ==# ''
+        let l:child_path = l:cur_layer.path
+    endif
+    let s:trace_gen += 1
+    let s:trace_busy = 1
+    let l:gen = s:trace_gen
     " 全异步链：diff hunk 映射 → 读取父版本内容 → 建缓冲区 → 入栈
     call s:ChildToParentLineAsync(l:child_commit, l:child_path, l:record,
                 \ {ok, parent_line, diff_lines ->
                 \     s:PushOlderAfterMap(ok, parent_line, l:record,
-                \         l:cur_layer)})
+                \         l:cur_layer, l:gen)})
+endfunction
+
+function! s:TraceIsCurrent(gen, layer) abort
+    return a:gen == s:trace_gen && s:trace_busy && s:active
+                \ && s:BlameWin() && s:SourceWin() && !empty(s:stack)
+                \ && s:stack[-1] is a:layer
+endfunction
+
+function! s:FinishTrace(gen) abort
+    if a:gen == s:trace_gen
+        let s:trace_busy = 0
+    endif
+endfunction
+
+function! s:InvalidateTrace() abort
+    let s:trace_gen += 1
+    let s:trace_busy = 0
 endfunction
 
 " diff 映射完成后：校验行号是否有效，再异步取父版本内容
-function! s:PushOlderAfterMap(ok, parent_line, record, cur_layer) abort
+function! s:PushOlderAfterMap(ok, parent_line, record, cur_layer, gen) abort
+    if !s:TraceIsCurrent(a:gen, a:cur_layer)
+        return
+    endif
     if !a:ok
+        call s:FinishTrace(a:gen)
         call s:Error('无法计算父版本行号（git diff 失败）')
         return
     endif
     if a:parent_line <= 0
+        call s:FinishTrace(a:gen)
         call s:Info('该行在 commit ' . strpart(a:record.hash, 0, 10)
                     \ . ' 中首次引入，没有更早的来源')
         return
@@ -1212,25 +1290,33 @@ function! s:PushOlderAfterMap(ok, parent_line, record, cur_layer) abort
     let l:key = l:prev . ':' . l:prev_path
     if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
         call s:FinishPush(l:prev, l:prev_path, s:src_bufs[l:key],
-                    \ a:parent_line, a:cur_layer)
+                    \ a:parent_line, a:cur_layer, a:gen)
         return
     endif
     call s:Info('正在追溯 ' . strpart(l:prev, 0, 10) . ' …')
     call s:GitShowFileAsync(l:prev, l:prev_path,
                 \ {ok, lines -> s:PushOlderAfterShow(ok, lines, l:prev,
-                \     l:prev_path, a:parent_line, a:cur_layer)})
+                \     l:prev_path, a:parent_line, a:cur_layer, a:gen)})
 endfunction
 
-function! s:PushOlderAfterShow(ok, lines, prev, prev_path, parent_line, cur_layer) abort
+function! s:PushOlderAfterShow(ok, lines, prev, prev_path, parent_line, cur_layer, gen) abort
+    if !s:TraceIsCurrent(a:gen, a:cur_layer)
+        return
+    endif
     if !a:ok
+        call s:FinishTrace(a:gen)
         call s:Error('无法读取 ' . strpart(a:prev, 0, 10) . ' 版本的文件内容')
         return
     endif
     let l:bufnr = s:CreateSrcBuffer(a:prev, a:prev_path, a:lines)
-    call s:FinishPush(a:prev, a:prev_path, l:bufnr, a:parent_line, a:cur_layer)
+    call s:FinishPush(a:prev, a:prev_path, l:bufnr, a:parent_line,
+                \ a:cur_layer, a:gen)
 endfunction
 
-function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer) abort
+function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer, gen) abort
+    if !s:TraceIsCurrent(a:gen, a:cur_layer)
+        return
+    endif
     " 记录当前层光标行，出栈时恢复
     let s:stack[-1].line = s:FileLine()
     call add(s:stack, {'commit': a:prev, 'path': a:prev_path,
@@ -1240,6 +1326,7 @@ function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer) abort
     let l:sw = s:SourceWin()
     if !l:sw || !s:ShowLayerInSource(l:layer)
         call remove(s:stack, -1)
+        call s:FinishTrace(a:gen)
         call s:Error('源窗口已不存在，无法入栈')
         return
     endif
@@ -1248,11 +1335,13 @@ function! s:FinishPush(prev, prev_path, bufnr, parent_line, cur_layer) abort
                 \ 'call cursor(min([' . a:parent_line . ', ' . l:count . ']), 1)')
     call s:UpdateBlameStatusline()
     call s:UpdateCompactStatusline()
+    call s:FinishTrace(a:gen)
     call s:BlameRequest('push', 0)
 endfunction
 
 " Backspace：返回较新的层（出栈）
 function! s:PopNewer() abort
+    call s:InvalidateTrace()
     if len(s:stack) <= 1
         call s:Info('已在工作区层')
         return
@@ -1297,6 +1386,7 @@ endfunction
 
 " 清空历史栈，源窗口切回工作区文件缓冲区（关闭 blame / 退出前调用）
 function! s:ClearStack() abort
+    call s:InvalidateTrace()
     let l:sw = s:SourceWin()
     let l:line = s:stack[-1].line
     if l:sw && winbufnr(l:sw) != s:file_bufnr
@@ -1350,14 +1440,18 @@ function! s:ConfigureHistoryBuffer(kind) abort
     setlocal noscrollbind
     let b:vimb_history_kind = a:kind
     let &l:statusline = a:kind ==# 'file'
-                \ ? ' vimb 文件历史  |  gh: 文件  gl: 行  q: 关闭 '
-                \ : ' vimb 行历史  |  gh: 文件  gl: 行  q: 关闭 '
+                \ ? ' vimb 文件历史  |  Enter: commit  Tab: 进入版本  y/o: SHA/浏览器  q: 关闭 '
+                \ : ' vimb 行历史  |  Enter: commit  Tab: 进入版本  y/o: SHA/浏览器  q: 关闭 '
     silent execute 'file ' . fnameescape('[vimb-history]')
 
     nnoremap <buffer> <silent> q :call <SID>CloseHistory()<CR>
     nnoremap <buffer> <silent> <C-c> :call <SID>CloseHistory()<CR>
     nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
     nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
+    nnoremap <buffer> <silent> <CR> :call <SID>OpenHistoryCommit()<CR>
+    nnoremap <buffer> <silent> <Tab> :call <SID>EnterHistoryRevision()<CR>
+    nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
+    nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
 
     augroup VimbWorkspace
@@ -1422,10 +1516,11 @@ function! s:ShowFileHistory() abort
     call win_execute(l:hw, 'call s:ReplaceCurrentBuffer(["' . l:title . '", "' . l:rule . '", "", "(正在加载文件历史 …)"])')
     let s:history_gen += 1
     let l:gen = s:history_gen
-    " --follow 让 rename 后仍能追到旧文件的历史；format 串必须整体
-    " 引号包裹，否则 %h 等会被 sh 展开
+    " --name-status 用 rename 状态维护每条历史记录当时的路径，Tab 才能
+    " 直接进入 rename 前的 revision。format 串必须整体引号包裹。
     let l:cmd = s:GitBase()
-                \ . " log --follow --pretty=format:'%h|%an|%ad|%s' --date=short"
+                \ . " log --follow --name-status"
+                \ . " --pretty=format:'COMMIT@%H|%h|%an|%ad|%s' --date=short"
     if l:commit !=# ''
         let l:cmd .= ' ' . shellescape(l:commit)
     endif
@@ -1458,7 +1553,7 @@ function! s:ShowLineHistory() abort
     endif
     let l:cmd .= ' -L ' . l:line . ',' . l:line . ':'
                 \ . shellescape(l:path)
-                \ . " --pretty=format:'COMMIT@%h|%an|%ad|%s'"
+                \ . " --pretty=format:'COMMIT@%H|%h|%an|%ad|%s'"
                 \ . ' --date=short 2>&1'
     call s:GitLines(l:cmd,
                 \ {ok, lines -> s:HistoryRendered('line', ok, lines, l:gen,
@@ -1477,25 +1572,121 @@ function! s:HistoryRendered(kind, ok, lines, gen, hw, title, rule, path) abort
         return
     endif
     let l:content = [a:title, a:rule, '']
+    let l:records = [{}, {}, {}]
     if a:kind ==# 'file'
+        let l:current_path = a:path
         for l:raw in a:lines
-            let l:parts = split(l:raw, '|', 1)
-            if len(l:parts) >= 4
-                call add(l:content, printf('%-10s %-12s %s  %s', l:parts[0],
-                            \ l:parts[1], l:parts[2],
-                            \ join(l:parts[3:], '|')))
+            if stridx(l:raw, 'COMMIT@') == 0
+                let l:parts = split(strpart(l:raw, 7), '|', 1)
             else
-                call add(l:content, l:raw)
+                let l:parts = []
+            endif
+            if len(l:parts) >= 5
+                let l:record = {'hash': l:parts[0], 'short_hash': l:parts[1],
+                            \ 'author': l:parts[2], 'date': l:parts[3],
+                            \ 'summary': join(l:parts[4:], '|'),
+                            \ 'path': l:current_path}
+                " 作者列按显示宽度填充，避免中文作者名错位
+                call add(l:content, printf('%-10s ', l:record.short_hash)
+                            \ . s:ClipAndPad(l:record.author, 12) . ' '
+                            \ . l:record.date . '  ' . l:record.summary)
+                call add(l:records, l:record)
+            elseif l:raw =~# '^R\d*\t'
+                let l:renamed = split(l:raw, "\t", 1)
+                if len(l:renamed) >= 3 && l:renamed[2] ==# l:current_path
+                    let l:current_path = l:renamed[1]
+                endif
             endif
         endfor
     else
-        " git log -L 输出交织 commit 头与 diff，原样展示
-        let l:content += a:lines
+        " git log -L 输出交织 commit 头与 diff；commit 头转为可交互记录。
+        for l:raw in a:lines
+            if stridx(l:raw, 'COMMIT@') == 0
+                let l:parts = split(strpart(l:raw, 7), '|', 1)
+            else
+                let l:parts = []
+            endif
+            if len(l:parts) >= 5
+                let l:record = {'hash': l:parts[0], 'short_hash': l:parts[1],
+                            \ 'author': l:parts[2], 'date': l:parts[3],
+                            \ 'summary': join(l:parts[4:], '|'), 'path': a:path}
+                call add(l:content, printf('%-10s ', l:record.short_hash)
+                            \ . s:ClipAndPad(l:record.author, 12) . ' '
+                            \ . l:record.date . '  ' . l:record.summary)
+                call add(l:records, l:record)
+            else
+                call add(l:content, l:raw)
+                call add(l:records, {})
+            endif
+        endfor
     endif
     call win_execute(a:hw,
                 \ 'call s:ReplaceCurrentBuffer(' . string(l:content) . ')')
+    call setbufvar(s:history_bufnr, 'vimb_history_records', l:records)
 endfunction
 
+function! s:CurrentHistoryRecord() abort
+    if !s:WindowMatches(s:history_winid, s:history_bufnr)
+                \ || win_getid() != s:history_winid
+        return {}
+    endif
+    return get(get(b:, 'vimb_history_records', []), line('.') - 1, {})
+endfunction
+
+function! s:OpenHistoryCommit() abort
+    let l:record = s:CurrentHistoryRecord()
+    if empty(l:record)
+        call s:Info('请将光标移到一条 commit 记录上')
+        return
+    endif
+    call s:OpenCommitForRecord(l:record)
+endfunction
+
+function! s:EnterHistoryRevision() abort
+    let l:record = s:CurrentHistoryRecord()
+    if empty(l:record)
+        call s:Info('请将光标移到一条 commit 记录上')
+        return
+    endif
+    if s:trace_busy
+        call s:Info('正在追溯，请稍候 …')
+        return
+    endif
+    let l:cur_layer = s:stack[-1]
+    if l:cur_layer.commit ==# l:record.hash && l:cur_layer.path ==# l:record.path
+        call s:Info('已经位于所选 revision')
+        return
+    endif
+    let l:target_line = s:FileLine()
+    let s:trace_gen += 1
+    let s:trace_busy = 1
+    let l:gen = s:trace_gen
+    let l:key = l:record.hash . ':' . l:record.path
+    call s:CloseHistory()
+    if has_key(s:src_bufs, l:key) && bufexists(s:src_bufs[l:key])
+        call s:FinishPush(l:record.hash, l:record.path, s:src_bufs[l:key],
+                    \ l:target_line, l:cur_layer, l:gen)
+        return
+    endif
+    call s:Info('正在进入 ' . strpart(l:record.hash, 0, 10) . ' …')
+    call s:GitShowFileAsync(l:record.hash, l:record.path,
+                \ {ok, lines -> s:HistoryRevisionLoaded(ok, lines, l:record,
+                \     l:target_line, l:cur_layer, l:gen)})
+endfunction
+
+function! s:HistoryRevisionLoaded(ok, lines, record, target_line, cur_layer, gen) abort
+    if !s:TraceIsCurrent(a:gen, a:cur_layer)
+        return
+    endif
+    if !a:ok
+        call s:FinishTrace(a:gen)
+        call s:Error('无法读取所选 revision 的文件内容')
+        return
+    endif
+    let l:bufnr = s:CreateSrcBuffer(a:record.hash, a:record.path, a:lines)
+    call s:FinishPush(a:record.hash, a:record.path, l:bufnr, a:target_line,
+                \ a:cur_layer, a:gen)
+endfunction
 function! s:RenderCommit(record, file_only) abort
     let b:vimb_hash = a:record.hash
     let b:vimb_file_only = a:file_only
@@ -1663,6 +1854,7 @@ function! s:CommitGone() abort
 endfunction
 
 function! s:CloseBlame() abort
+    call s:InvalidateTrace()
     let l:fw = s:SourceWin()
     " 先清历史栈把源窗口切回真实文件，再按真实文件视图恢复
     if len(s:stack) > 1
@@ -1692,6 +1884,7 @@ function! s:CloseBlame() abort
 endfunction
 
 function! s:BlameGone() abort
+    call s:InvalidateTrace()
     let s:blame_winid = -1
     let s:blame_bufnr = -1
     let s:active = 0
@@ -1718,6 +1911,7 @@ function! s:BlameGone() abort
 endfunction
 
 function! s:SourceGone() abort
+    call s:InvalidateTrace()
     let s:closing_blame = 1
     try
         call s:CloseCommit(0)
@@ -1776,6 +1970,9 @@ function! s:FocusRecord() abort
         return s:CurrentRecord()
     elseif win_getid() == s:SourceWin()
         return s:CurrentLayerRecord()
+    elseif s:WindowMatches(s:history_winid, s:history_bufnr)
+                \ && win_getid() == s:history_winid
+        return s:CurrentHistoryRecord()
     endif
     return {}
 endfunction
@@ -1931,9 +2128,11 @@ function! s:OpenInBrowser() abort
     call s:Info('已打开 ' . l:url)
 endfunction
 command! -nargs=1 VimbCommitURL echo <SID>CommitWebURL(<f-args>)
-
 function! s:Help() abort
-    if s:CommitWin()
+    if s:WindowMatches(s:history_winid, s:history_bufnr)
+                \ && win_getid() == s:history_winid
+        call s:Info('history: Enter 查看 commit；Tab 进入该 revision；y 复制 SHA；o 浏览器；gh/gl 切换；q 关闭')
+    elseif s:CommitWin()
         call s:Info('commit: f 仅此文件/全部文件；i 信息；y 复制 SHA；o 浏览器打开；gh 文件历史；gl 行历史；q/Backspace/Ctrl-O 返回；gb 关闭全部')
     elseif win_getid() == s:BlameWin()
         call s:Info('blame: Enter 查看 commit；Tab 追溯历史；BS 返回；i 信息；y 复制 SHA；o 浏览器；gh/gl 历史；r 刷新；q 关闭')

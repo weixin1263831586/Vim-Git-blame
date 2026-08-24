@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
 # vimb 安装脚本：从 GitHub 下载 vimb 并安装到 ~/.local/bin
 # 用法: curl --proto '=https' --tlsv1.2 -fsSL \
-#       https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
+#       https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/v2.3.0/install.sh | sh
 # 可通过 BIN_DIR 环境变量覆盖安装目录，例如: BIN_DIR=/usr/local/bin sh install.sh
+# 校验测试自定义版本时需同时传 VIMB_VERSION 与对应的 VIMB_SHA256。
 
 set -eu
 
-REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main"
-BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-
 msg() { printf 'vimb-installer: %s\n' "$*"; }
 die() { printf 'vimb-installer: %s\n' "$*" >&2; exit 1; }
+
+DEFAULT_VERSION="v2.3.0"
+DEFAULT_SHA256="eabdf3a3529c570e8dcac82c6bed26b898ba3392e5294cf46d5bb695247118c2"
+VIMB_VERSION="${VIMB_VERSION:-$DEFAULT_VERSION}"
+if [ "$VIMB_VERSION" = "$DEFAULT_VERSION" ]; then
+    EXPECTED_SHA256="${VIMB_SHA256:-$DEFAULT_SHA256}"
+else
+    [ -n "${VIMB_SHA256:-}" ] \
+        || die "自定义 VIMB_VERSION 时必须同时提供 VIMB_SHA256"
+    EXPECTED_SHA256=$VIMB_SHA256
+fi
+case "$EXPECTED_SHA256" in
+    *[!0-9a-f]*|'') die "VIMB_SHA256 必须是小写十六进制 SHA-256" ;;
+esac
+[ "${#EXPECTED_SHA256}" -eq 64 ] || die "VIMB_SHA256 长度必须为 64"
+
+REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/$VIMB_VERSION"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
     || die "需要 curl 或 wget 之一"
@@ -25,17 +41,35 @@ fetch() {
     fi
 }
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "需要 sha256sum 或 shasum 校验下载内容"
+    fi
+}
+
 TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/vimb-install.XXXXXX")
 trap 'rm -f -- "$TMP_FILE"' EXIT
 
-msg "正在下载 vimb ..."
+msg "正在下载 vimb $VIMB_VERSION ..."
 fetch "$REPO_RAW/vimb" >"$TMP_FILE"
+
+ACTUAL_SHA256=$(sha256_file "$TMP_FILE")
+[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
+    || die "SHA-256 校验失败，拒绝安装（下载内容可能损坏或被篡改）"
 
 # 校验下载内容确实是 vimb 脚本，避免把错误页面装进 PATH
 head -1 "$TMP_FILE" | grep -q '^#!/usr/bin/env bash' \
     || die "下载内容不是 vimb 脚本，请检查网络后重试"
 grep -q '^VERSION=' "$TMP_FILE" \
     || die "下载内容不完整，请检查网络后重试"
+case "$(bash "$TMP_FILE" --version 2>/dev/null)" in
+    "vimb ${VIMB_VERSION#v}") ;;
+    *) die "下载脚本版本与请求的 $VIMB_VERSION 不一致" ;;
+esac
 
 mkdir -p "$BIN_DIR"
 install -m 755 "$TMP_FILE" "$BIN_DIR/vimb"
