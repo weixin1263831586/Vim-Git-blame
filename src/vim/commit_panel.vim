@@ -67,6 +67,7 @@ function! s:OpenCommitForRecord(record) abort
         setlocal winfixheight
         call s:RestoreView(l:fw, l:file_view)
         call s:RestoreView(l:bw, l:blame_view)
+        call s:AlignBlameToSource()
     else
         call win_gotoid(l:cw)
     endif
@@ -143,7 +144,7 @@ function! s:ReturnToFile() abort
         call winrestview(s:return_view)
     endif
     if s:BlameWin()
-        syncbind
+        call s:AlignBlameToSource()
     endif
 endfunction
 

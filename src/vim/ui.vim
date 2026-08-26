@@ -145,7 +145,8 @@ endfunction
 
 function! s:InstallActiveFileMaps() abort
     let s:file_maps = {}
-    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o', 'gh', 'gl']
+    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o',
+                \ 'gh', 'gl', '<2-LeftMouse>']
         call s:SaveFileMap(l:lhs)
     endfor
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
@@ -157,10 +158,12 @@ function! s:InstallActiveFileMaps() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
     nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
+    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
 endfunction
 
 function! s:RestoreActiveFileMapsHere() abort
-    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o', 'gh', 'gl']
+    for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o',
+                \ 'gh', 'gl', '<2-LeftMouse>']
         execute 'silent! nunmap <buffer> ' . l:lhs
         let l:mapping = get(s:file_maps, l:lhs, {})
         if !empty(l:mapping)
@@ -216,9 +219,10 @@ function! s:ConfigureBlameBuffer() abort
     let &l:statusline = ' vimb blame  |  click/Enter: commit  |  q: close '
     silent execute 'file ' . fnameescape('[vimb-blame]')
 
-    " Open on release. The normal press has already selected the exact row,
-    " and the complete terminal mouse sequence is consumed before relayout.
-    nnoremap <buffer> <silent> <LeftRelease> :call <SID>MouseClick()<CR>
+    " 单击要等双击判定窗口结束再打开 commit；否则第一次 release 就改变
+    " 布局，第二次点击既无法构成双击，也无法选择/复制 blame 文本。
+    nnoremap <buffer> <silent> <LeftRelease> :call <SID>ScheduleMouseClick()<CR>
+    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommit()<CR>
     nnoremap <buffer> <silent> <Tab> :call <SID>PushOlder()<CR>
     nnoremap <buffer> <silent> <BS> :call <SID>PopNewer()<CR>
@@ -269,6 +273,7 @@ function! s:ConfigureCommitBuffer() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
 
     augroup VimbWorkspace
         autocmd! * <buffer>

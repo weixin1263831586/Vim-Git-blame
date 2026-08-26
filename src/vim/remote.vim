@@ -66,15 +66,40 @@ function! s:YankHash() abort
         call s:Info('该行是未提交的工作区内容，没有 commit 可复制')
         return
     endif
-    let @" = l:hash
+    call s:CopyText(l:hash)
+    call s:Info('已复制 ' . strpart(l:hash, 0, 12)
+                \ . (empty(@+) ? '' : '（含系统剪贴板）'))
+endfunction
+
+" 把文本写入 Vim 寄存器；终端 Vim 没有 +clipboard 时，用 OSC 52 请求
+" 终端写系统剪贴板。OSC 52 失败不会影响 Vim 内部复制。
+function! s:CopyText(text) abort
+    let @" = a:text
     for l:reg in ['+', '*']
         try
-            call setreg(l:reg, l:hash)
+            call setreg(l:reg, a:text)
         catch
         endtry
     endfor
-    call s:Info('已复制 ' . strpart(l:hash, 0, 12)
-                \ . (empty(@+) ? '' : '（含系统剪贴板）'))
+    if empty(@+) && !has('gui_running') && executable('base64')
+                \ && strlen(a:text) <= 100000
+        try
+            let l:encoded = substitute(system('base64', a:text), '\s', '', 'g')
+            if !empty(l:encoded)
+                call writefile(["\x1b]52;c;" . l:encoded . "\x07"],
+                            \ '/dev/tty', 'b')
+            endif
+        catch
+        endtry
+    endif
+endfunction
+
+function! s:CopyVisualSelection() abort
+    " 默认 <2-LeftMouse> 已按 Vim 的 iskeyword 规则选中单词。
+    silent normal! gvy
+    let l:text = @"
+    call s:CopyText(l:text)
+    call s:Info('已复制 ' . substitute(l:text, "\n", ' ', 'g'))
 endfunction
 
 " o：在浏览器打开 commit

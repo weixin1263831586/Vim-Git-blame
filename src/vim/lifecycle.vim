@@ -1,4 +1,5 @@
 function! s:CloseBlame() abort
+    call s:CancelMouseClick()
     call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let l:fw = s:SourceWin()
@@ -102,6 +103,40 @@ function! s:MouseClick() abort
         call s:BlameCursorMoved()
         call s:ShowCommit()
     endif
+endfunction
+
+function! s:CancelMouseClick() abort
+    if s:mouse_click_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:mouse_click_timer)
+    endif
+    let s:mouse_click_timer = -1
+endfunction
+
+function! s:RunMouseClick(timer, winid, line) abort
+    let s:mouse_click_timer = -1
+    if a:winid != s:BlameWin() || a:line <= 0
+        return
+    endif
+    call win_gotoid(a:winid)
+    call cursor(a:line, 1)
+    call s:BlameCursorMoved()
+    call s:ShowCommit()
+endfunction
+
+function! s:ScheduleMouseClick() abort
+    call s:CancelMouseClick()
+    if !exists('*getmousepos') || !exists('*timer_start')
+        call s:MouseClick()
+        return
+    endif
+    let l:mouse = getmousepos()
+    if get(l:mouse, 'winid', 0) != s:BlameWin() || get(l:mouse, 'line', 0) <= 0
+        return
+    endif
+    " 比 'mousetime' 多留一个很小的调度余量，保证第二次 mouse-down
+    " 可以先取消 pending 单击。
+    let s:mouse_click_timer = timer_start(&mousetime + 25,
+                \ {timer -> s:RunMouseClick(timer, l:mouse.winid, l:mouse.line)})
 endfunction
 
 function! s:Toggle() abort

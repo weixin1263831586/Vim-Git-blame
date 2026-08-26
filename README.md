@@ -10,6 +10,7 @@
 - blame 栏与文件窗口双向同步光标位置，`scrollbind` 联动滚动
 - 当前行的 commit 自动高亮，同属一个 commit 的所有行一起标出
 - 鼠标单击或 Enter 查看该行所属 commit 的完整信息（fuller 格式 + stat + patch）
+- 源码、blame 和 commit/history 面板均支持鼠标双击选择单词并复制；终端 Vim 无 `+clipboard` 时使用 OSC 52
 - **Tab 向前追溯**：基于 `previous` 字段入栈显示历史版本文件，rename/移动过的代码自动跟随旧路径；Backspace 逐层返回，blame 栏显示当前深度（如 `vimb blame 2 层 @79583ef`）
 - blame 视觉增强：连续相同 commit 的行合并显示（块首行显示作者/日期）、相邻 commit 块循环底色区分（256 色终端）、按当前时间计算的代码年龄热力（hash 列按新旧绿→蓝→灰着色）
 - 源窗口状态栏常驻显示当前行 commit 摘要（current-line compact 模式），关闭 blame 后恢复
@@ -86,6 +87,7 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 | 按键 | 位置 | 作用 |
 | --- | --- | --- |
 | 鼠标单击 / Enter | blame 栏或文件 | 查看该行所属 commit |
+| 鼠标双击 | 源码 / blame / commit / history | 选择单词并复制到剪贴板 |
 | Tab | blame 栏或文件 | 追溯该行到引入它的上一版（入栈，跟随 rename） |
 | Tab | history commit 行 | 进入所选 revision（跟随当时路径） |
 | Backspace | blame 栏或文件 | 返回较新版本（出栈） |

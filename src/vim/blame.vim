@@ -57,7 +57,7 @@ function! s:ApplyBlameRecords(bw, fw) abort
                     \ 'call cursor(min([' . l:line . ', line("$")]), 1)')
         call win_execute(a:bw, 'VimbHighlightCommit')
         if s:WindowMatches(a:fw, -1)
-            call win_execute(a:fw, 'syncbind')
+            call s:AlignBlameToSource()
         endif
         call s:UpdateCompactStatusline()
     finally

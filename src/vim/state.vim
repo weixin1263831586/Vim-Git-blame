@@ -72,6 +72,7 @@ let s:jobs = {}
 let s:job_seq = 0
 let s:blame_gen = 0
 let s:commit_gen = 0
+let s:mouse_click_timer = -1
 let s:commit_cache = {}
 let s:commit_cache_order = []
 let s:commit_cache_bytes = 0
@@ -188,6 +189,36 @@ function! s:RestoreView(winid, view) abort
     if !empty(a:view) && s:WindowMatches(a:winid, -1)
         call win_execute(a:winid, 'call winrestview(' . string(a:view) . ')')
     endif
+endfunction
+
+" scrollbind 维护的是相对滚动偏移；窗口分割/缩放时两侧分别恢复 view，
+" 容易把这个偏移固化成一行。以源窗口为准显式重置 blame 的 topline，
+" 同时让两个窗口重新建立零偏移的 scrollbind 基准。
+function! s:AlignBlameToSource() abort
+    let l:fw = s:SourceWin()
+    let l:bw = s:BlameWin()
+    if !l:fw || !l:bw
+        return
+    endif
+    let l:file_view = s:CaptureView(l:fw)
+    let l:blame_view = s:CaptureView(l:bw)
+    if empty(l:file_view) || empty(l:blame_view)
+        return
+    endif
+    let l:line = get(l:file_view, 'lnum', 1)
+    let l:blame_view.lnum = min([l:line, line('$', l:bw)])
+    let l:blame_view.col = 0
+    let l:blame_view.coladd = 0
+    let l:blame_view.curswant = 0
+    let l:blame_view.topline = get(l:file_view, 'topline', 1)
+    let l:blame_view.topfill = 0
+    call win_execute(l:fw, 'setlocal noscrollbind')
+    call win_execute(l:bw, 'setlocal noscrollbind')
+    call s:RestoreView(l:fw, l:file_view)
+    call s:RestoreView(l:bw, l:blame_view)
+    call win_execute(l:fw, 'setlocal scrollbind')
+    call win_execute(l:bw, 'setlocal scrollbind')
+    call win_execute(l:fw, 'syncbind')
 endfunction
 
 function! s:GitFailure(lines) abort

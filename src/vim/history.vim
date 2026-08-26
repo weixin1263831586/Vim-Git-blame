@@ -32,6 +32,7 @@ function! s:ConfigureHistoryBuffer(kind) abort
     nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
+    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
 
     augroup VimbWorkspace
         autocmd! * <buffer>
@@ -50,6 +51,7 @@ function! s:OpenBottomPanel(configure_fn) abort
         let s:history_bufnr = bufnr('%')
         execute 'resize ' . max([8, &lines * 2 / 5])
         setlocal winfixheight
+        call s:AlignBlameToSource()
     else
         call win_gotoid(s:history_winid)
     endif
@@ -74,6 +76,7 @@ function! s:CloseHistory() abort
     endif
     let s:history_winid = -1
     let s:history_bufnr = -1
+    call s:AlignBlameToSource()
 endfunction
 
 function! s:HistoryGone() abort

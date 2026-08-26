@@ -245,6 +245,8 @@ worktree:code.c:worktree.vim:
 rename:new_name.txt:rename.vim:
 big:big.txt:big.vim:
 enter:code.c:enter_commit.vim:
+mouse_copy:code.c:mouse_copy.vim:
+viewport_align:big.txt:viewport_align.vim:
 rename_current_enter_commit:new_name.txt:rename_current_enter_commit.vim:
 refresh:refresh_target.txt:refresh.vim:
 toggle:code.c:toggle_restore.vim:noauto
