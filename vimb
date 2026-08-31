@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="2.3.1"
+VERSION="2.4.0"
 
 usage() {
     cat <<'EOF'
@@ -13,6 +13,7 @@ usage() {
 
   -w / -M / -C        追加给 git blame 的选项：忽略空白 / 检测文件内移动 / 检测跨文件复制
   --blame-args=...    透传任意 git blame 选项，如 --blame-args="-w -M -C"
+  -u, --update        从 GitHub 下载最新 vimb 并替换自身后退出
 
   鼠标单击 / Enter   查看该行所属 commit
   鼠标双击           原生选词，释放左键自动复制到剪贴板
@@ -39,6 +40,102 @@ die() {
     exit 1
 }
 
+VIMB_REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame"
+VIMB_REPO_API_TIP="https://api.github.com/repos/weixin1263831586/Vim-Git-blame/commits/main"
+
+vimb_fetch() { # vimb_fetch <url>，内容写 stdout
+    if command -v curl >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -fsSL "$1"
+    else
+        wget -qO- "$1"
+    fi
+}
+
+# 解析 main 最新提交的不可变 SHA；失败时返回非 0（调用方回退到 main 引用）。
+vimb_latest_ref() {
+    local json shas
+    json=$(vimb_fetch "$VIMB_REPO_API_TIP" 2>/dev/null) || return 1
+    shas=$(printf '%s\n' "$json" \
+        | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p')
+    [ -n "$shas" ] || return 1
+    printf '%s\n' "${shas%%$'\n'*}"
+}
+
+# 自更新：下载最新 vimb 校验后原子替换自身。
+# VIMB_UPDATE_URL 可覆盖下载地址（镜像/测试）；VIMB_UPDATE_REF 可固定来源 ref。
+update_self() {
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+        || die "自更新需要 curl 或 wget 之一"
+
+    local self=$0 ref='' url=${VIMB_UPDATE_URL:-} new_version
+    case $self in
+        /*) ;;
+        *)  self=$(command -v -- "$self" 2>/dev/null || printf '%s\n' "$self") ;;
+    esac
+    if command -v readlink >/dev/null 2>&1; then
+        local resolved
+        if resolved=$(readlink -f -- "$self" 2>/dev/null) && [ -n "$resolved" ]; then
+            self=$resolved
+        fi
+    fi
+    [ -f "$self" ] || die "无法定位 vimb 自身路径: $0"
+
+    if [ -z "$url" ]; then
+        ref=${VIMB_UPDATE_REF:-}
+        if [ -z "$ref" ]; then
+            if ! ref=$(vimb_latest_ref); then
+                ref=''
+            fi
+        fi
+        [ -n "$ref" ] || {
+            ref=main
+            printf 'vimb: 无法访问 GitHub API，回退到可变引用 main\n' >&2
+        }
+        url="$VIMB_REPO_RAW/$ref/vimb"
+    fi
+
+    # 注意：EXIT trap 里的变量不能用 local——trap 在函数返回后才执行，
+    # 局部变量届时已销毁（set -u 下会报 unbound），因此用全局名。
+    VIMB_UPDATE_TMP=$(mktemp "${TMPDIR:-/tmp}/vimb-update.XXXXXX")
+    trap 'rm -f -- "$VIMB_UPDATE_TMP"' EXIT
+    if ! vimb_fetch "$url" >"$VIMB_UPDATE_TMP"; then
+        die "下载失败: $url"
+    fi
+
+    head -1 "$VIMB_UPDATE_TMP" | grep -q '^#!/usr/bin/env bash' \
+        || die "下载内容不是 vimb 脚本: $url"
+    grep -q '^VERSION=' "$VIMB_UPDATE_TMP" \
+        || die "下载内容不完整: $url"
+    new_version=$(bash "$VIMB_UPDATE_TMP" --version 2>/dev/null) \
+        || die "下载脚本无法执行，已放弃更新"
+    case "$new_version" in
+        'vimb '[0-9]*) ;;
+        *) die "下载脚本版本异常: $new_version" ;;
+    esac
+
+    if cmp -s "$VIMB_UPDATE_TMP" "$self"; then
+        printf 'vimb: 已是最新版本 %s\n' "${new_version#vimb }"
+        return 0
+    fi
+
+    local dir=${self%/*} staged
+    [ -d "$dir" ] && [ -w "$dir" ] \
+        || die "无权限写入 $dir，请手动执行: install -m 755 <新版vimb> $self"
+    staged=$(mktemp "$dir/.vimb.update.XXXXXX") \
+        || die "在 $dir 创建临时文件失败"
+    cat >"$staged" <"$VIMB_UPDATE_TMP"
+    chmod 755 "$staged"
+    if ! mv -f -- "$staged" "$self"; then
+        rm -f -- "$staged"
+        die "替换 $self 失败"
+    fi
+    printf 'vimb: 已更新 %s → %s\n' "$VERSION" "${new_version#vimb }"
+    if [ -n "$ref" ]; then
+        printf 'vimb: 来源 %s\n' "$ref"
+    fi
+    return 0
+}
+
 case "${1:-}" in
     -h|--help)
         usage
@@ -46,6 +143,10 @@ case "${1:-}" in
         ;;
     --version)
         printf 'vimb %s\n' "$VERSION"
+        exit 0
+        ;;
+    -u|--update|--u)
+        update_self
         exit 0
         ;;
 esac

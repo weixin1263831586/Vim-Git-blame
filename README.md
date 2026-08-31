@@ -35,12 +35,10 @@
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/main/install.sh | sh
 ```
 
-安装器会从不可变的发布 commit 下载 `vimb`，并校验内置 SHA-256；因此安装入口可以使用 `main`，实际安装内容不会随分支漂移。
-
-如果连安装器本身也要求固定不变，可使用当前已审计的不可变入口：
+安装器默认安装 `main` 的最新提交：先通过 GitHub API 把 `main` 解析成不可变 commit SHA，再从该 SHA 下载并校验脚本结构，之后运行 `vimb --update` 即可保持最新。需要精确固定安装内容时（审计、复现），显式指定来源与校验和：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/de123d49bf5ef4f98d3ad6eff264d8f07e3cdcb6/install.sh | sh
+VIMB_REF=<commit> VIMB_SHA256=<该 commit 中 vimb 的 SHA-256> sh install.sh
 ```
 
 或手动安装：
@@ -50,7 +48,11 @@ git clone git@github.com:weixin1263831586/Vim-Git-blame.git
 install -m 755 Vim-Git-blame/vimb ~/.local/bin/vimb
 ```
 
-要求 `~/.local/bin` 在 `PATH` 中。
+要求 `~/.local/bin` 在 `PATH` 中。已安装的用户可以随时自更新到最新版：
+
+```bash
+vimb --update     # 或简写 vimb -u
+```
 
 ## 使用
 
@@ -69,6 +71,7 @@ vimb -- <文件>
 ```bash
 vimb -h          # 查看帮助
 vimb --version   # 查看版本
+vimb --update    # 从 GitHub 更新自身到最新版（简写 vimb -u）
 ```
 
 ```bash
@@ -129,7 +132,7 @@ History Explorer 的 Tab 会用 Git line-log 找到当前逻辑行的稳定身�
 bash scripts/build.sh      # 从 src/ 重新生成单文件发布物 vimb
 bash test/run.sh          # 回归测试（异步路径）
 VIMB_SYNC=1 bash test/run.sh   # 同步路径再跑一遍
-bash scripts/verify-release-payload.sh  # 下载并验证安装器固定的发布物
+bash scripts/verify-release-payload.sh  # 下载并验证安装器默认路径（main 最新提交）
 ```
 
 `src/vim/` 使用职责明确的语义化文件名；模块加载顺序只由 `scripts/build.sh` 的 `MODULES` 清单决定，不依赖目录遍历或文件名排序。构建脚本会拒绝缺失、重复以及未登记的 `.vim` 模块，避免新增文件被静默遗漏。所有模块最终拼进同一个 Vim script，共享 script-local (`s:`) 命名空间；当前依赖顺序为 `state → git → commit_cache → visual → ui → blame → stack → history → commit_panel → lifecycle → remote → bootstrap`。新增跨模块调用时，应确保提供者排在使用者之前，并同步更新 `MODULES` 清单。

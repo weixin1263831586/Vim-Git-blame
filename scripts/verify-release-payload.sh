@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
-# Verify that install.sh's immutable default payload still exists and matches.
+# Verify the installer's default download path: resolve the main tip via the
+# GitHub API, download vimb at that immutable commit, and check it is runnable.
 
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-INSTALLER="$ROOT/install.sh"
+REPO="weixin1263831586/Vim-Git-blame"
+API_TIP="https://api.github.com/repos/$REPO/commits/main"
+RAW_BASE="https://raw.githubusercontent.com/$REPO"
 
-read_default() {
-    local name=$1 value
-    value=$(sed -n "s/^${name}=\"\([^\"]*\)\"$/\1/p" "$INSTALLER")
-    [ -n "$value" ] || {
-        printf 'release-payload: cannot read %s from install.sh\n' "$name" >&2
-        exit 1
-    }
-    printf '%s\n' "$value"
-}
-
-VERSION=$(read_default DEFAULT_VERSION)
-REF=$(read_default DEFAULT_REF)
-EXPECTED_SHA256=$(read_default DEFAULT_SHA256)
-URL="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame/$REF/vimb"
+API_JSON=$(mktemp "${TMPDIR:-/tmp}/vimb-release-api.XXXXXX")
 PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/vimb-release-payload.XXXXXX")
-trap 'rm -f -- "$PAYLOAD"' EXIT
+trap 'rm -f -- "$API_JSON" "$PAYLOAD"' EXIT
 
+curl --proto '=https' --tlsv1.2 -fsSL "$API_TIP" -o "$API_JSON"
+REF=$(sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' "$API_JSON" | head -n 1)
+[ -n "$REF" ] || {
+    printf 'release-payload: cannot resolve main tip sha\n' >&2
+    exit 1
+}
+
+URL="$RAW_BASE/$REF/vimb"
 curl --proto '=https' --tlsv1.2 -fsSL "$URL" -o "$PAYLOAD"
-ACTUAL_SHA256=$(sha256sum "$PAYLOAD" | awk '{print $1}')
-[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || {
-    printf 'release-payload: SHA mismatch for %s\n' "$URL" >&2
-    printf 'expected %s\nactual   %s\n' "$EXPECTED_SHA256" "$ACTUAL_SHA256" >&2
+head -1 "$PAYLOAD" | grep -q '^#!/usr/bin/env bash' || {
+    printf 'release-payload: payload is not the vimb script\n' >&2
     exit 1
 }
-[ "$(bash "$PAYLOAD" --version)" = "vimb ${VERSION#v}" ] || {
-    printf 'release-payload: version mismatch for %s\n' "$URL" >&2
+VERSION=$(bash "$PAYLOAD" --version 2>/dev/null) || {
+    printf 'release-payload: payload does not run\n' >&2
     exit 1
 }
+case "$VERSION" in
+    'vimb '[0-9]*) ;;
+    *) printf 'release-payload: unexpected version output: %s\n' "$VERSION" >&2
+       exit 1 ;;
+esac
 
 printf 'PASS release payload %s @ %s\n' "$VERSION" "$REF"

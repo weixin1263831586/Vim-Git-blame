@@ -340,6 +340,45 @@ cli_dashdash() {
 }
 cli_dashdash '-w'
 
+# CLI：vimb -u / --update 自更新（mock curl 提供本地“最新版”）
+cli_update() {
+    local bin_dir="$WORK/update-bin" mock_dir="$WORK/update-mock" out rc=0
+    mkdir -p "$bin_dir" "$mock_dir"
+    sed 's/^VERSION=.*/VERSION="0.0.0"/' "$VIMB" >"$bin_dir/vimb"
+    chmod 755 "$bin_dir/vimb"
+    cat >"$mock_dir/curl" <<EOF
+#!/usr/bin/env bash
+exec /bin/cat "$VIMB"
+EOF
+    chmod 755 "$mock_dir/curl"
+
+    out=$(env PATH="$mock_dir:$PATH" VIMB_UPDATE_URL=mock://vimb \
+        "$bin_dir/vimb" -u 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q '已更新' \
+        || ! cmp -s "$VIMB" "$bin_dir/vimb" || [ ! -x "$bin_dir/vimb" ]; then
+        log "FAIL cli_update (stale → update)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=$((fail + 1))
+        failed_names="$failed_names cli_update"
+        return
+    fi
+
+    rc=0
+    out=$(env PATH="$mock_dir:$PATH" VIMB_UPDATE_URL=mock://vimb \
+        "$bin_dir/vimb" --update 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] && echo "$out" | grep -q '已是最新版本' \
+        && cmp -s "$VIMB" "$bin_dir/vimb"; then
+        log "PASS cli_update"
+        pass=$((pass + 1))
+    else
+        log "FAIL cli_update (already latest)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=$((fail + 1))
+        failed_names="$failed_names cli_update"
+    fi
+}
+cli_update
+
 log "=== 结果: $pass 通过, $fail 失败 ==="
 if [ "$fail" -gt 0 ]; then
     log "失败用例:$failed_names"
