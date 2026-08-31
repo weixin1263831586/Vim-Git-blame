@@ -15,7 +15,8 @@ usage() {
   --blame-args=...    透传任意 git blame 选项，如 --blame-args="-w -M -C"
 
   鼠标单击 / Enter   查看该行所属 commit
-  鼠标双击           选择单词并复制到剪贴板
+  鼠标双击           原生选词，释放左键自动复制到剪贴板
+  鼠标拖拽           原生选区，释放左键自动复制完整文本
   Tab / Backspace    向前追溯该行的历史 commit / 返回较新版本
   gh / gl            文件历史 / 当前行历史
   i                  轻量 commit 信息（作者/日期/previous）

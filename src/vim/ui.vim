@@ -143,11 +143,37 @@ function! s:SaveFileMap(lhs) abort
                 \ ? l:mapping : {}
 endfunction
 
+function! s:SaveFileVisualMap(lhs) abort
+    let l:mapping = maparg(a:lhs, 'v', 0, 1)
+    let s:file_visual_maps[a:lhs] = !empty(l:mapping)
+                \ && get(l:mapping, 'buffer', 0) ? l:mapping : {}
+endfunction
+
+" 所有 vimb 可读窗口共用：不映射 <2-LeftMouse>（及三击/四击），双击选词、
+" 三击选行、拖拽选区全部保持 Vim 原生行为（含 Visual 模式下的锚点重置）。
+" 只在 Visual 模式释放左键时复制 '< '> 标记记录的选区并保持高亮。
+" RHS 必须先重放同一个 release 事件，让 Vim 内建逻辑用真实松手坐标
+" 落定选区终点；终端可能合并最后几个 drag 事件，若直接调复制函数，
+" 就会只复制到上一个 drag 坐标。noremap 保证这个内建事件不会递归。
+function! s:InstallCopyMouseMaps() abort
+    for l:ev in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
+                \ '<4-LeftRelease>']
+        execute 'vnoremap <buffer> <silent> ' . l:ev
+                    \ . ' ' . l:ev
+                    \ . ':<C-U>call <SID>CopyMouseSelection()<CR>'
+    endfor
+endfunction
+
 function! s:InstallActiveFileMaps() abort
     let s:file_maps = {}
+    let s:file_visual_maps = {}
     for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o',
-                \ 'gh', 'gl', '<2-LeftMouse>']
+                \ 'gh', 'gl']
         call s:SaveFileMap(l:lhs)
+    endfor
+    for l:lhs in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
+                \ '<4-LeftRelease>']
+        call s:SaveFileVisualMap(l:lhs)
     endfor
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommitAtFileLine()<CR>
@@ -158,19 +184,28 @@ function! s:InstallActiveFileMaps() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
     nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
-    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
+    call s:InstallCopyMouseMaps()
 endfunction
 
 function! s:RestoreActiveFileMapsHere() abort
     for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o',
-                \ 'gh', 'gl', '<2-LeftMouse>']
+                \ 'gh', 'gl']
         execute 'silent! nunmap <buffer> ' . l:lhs
         let l:mapping = get(s:file_maps, l:lhs, {})
         if !empty(l:mapping)
             call mapset('n', 0, l:mapping)
         endif
     endfor
+    for l:lhs in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
+                \ '<4-LeftRelease>']
+        execute 'silent! vunmap <buffer> ' . l:lhs
+        let l:mapping = get(s:file_visual_maps, l:lhs, {})
+        if !empty(l:mapping)
+            call mapset('v', 0, l:mapping)
+        endif
+    endfor
     let s:file_maps = {}
+    let s:file_visual_maps = {}
 endfunction
 
 function! s:ActivateFile() abort
@@ -222,7 +257,7 @@ function! s:ConfigureBlameBuffer() abort
     " 单击要等双击判定窗口结束再打开 commit；否则第一次 release 就改变
     " 布局，第二次点击既无法构成双击，也无法选择/复制 blame 文本。
     nnoremap <buffer> <silent> <LeftRelease> :call <SID>ScheduleMouseClick()<CR>
-    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
+    call s:InstallCopyMouseMaps()
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommit()<CR>
     nnoremap <buffer> <silent> <Tab> :call <SID>PushOlder()<CR>
     nnoremap <buffer> <silent> <BS> :call <SID>PopNewer()<CR>
@@ -273,7 +308,7 @@ function! s:ConfigureCommitBuffer() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
-    nnoremap <buffer> <silent> <2-LeftMouse> :call <SID>CancelMouseClick()<CR><2-LeftMouse>:<C-U>call <SID>CopyVisualSelection()<CR>gv
+    call s:InstallCopyMouseMaps()
 
     augroup VimbWorkspace
         autocmd! * <buffer>

@@ -311,6 +311,18 @@ log "fixture: $FIXTURE"
 build_fixture
 run_all "$@"
 
+# 真实鼠标事件端到端（pty + SGR 序列 + xclip 替身）；VIMB_SYNC=1 复跑时跳过
+if [ "${VIMB_SYNC:-}" != "1" ]; then
+    if bash "$ROOT/test/mouse_e2e.sh"; then
+        log "PASS mouse_e2e"
+        pass=$((pass + 1))
+    else
+        log "FAIL mouse_e2e"
+        fail=$((fail + 1))
+        failed_names="$failed_names mouse_e2e"
+    fi
+fi
+
 # CLI：vimb -w -- -foo.c 形式（-- 在选项之后）
 cli_dashdash() {
     local bad=$1

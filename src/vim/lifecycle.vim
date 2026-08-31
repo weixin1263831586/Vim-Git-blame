@@ -117,6 +117,13 @@ function! s:RunMouseClick(timer, winid, line) abort
     if a:winid != s:BlameWin() || a:line <= 0
         return
     endif
+    " 单击只在窗口始终停留在 Normal 模式时才生效：双击的第二击、拖拽都会
+    " 进入 Visual。定时器触发时若已不在 Normal，说明那次按下演变成了
+    " 双击/拖拽，放弃打开 commit 面板（不能在鼠标事件中途用 autocmd 干预，
+    " 会破坏 Vim 内部的多击判定状态机）。
+    if mode() !~# '^n'
+        return
+    endif
     call win_gotoid(a:winid)
     call cursor(a:line, 1)
     call s:BlameCursorMoved()
@@ -133,8 +140,8 @@ function! s:ScheduleMouseClick() abort
     if get(l:mouse, 'winid', 0) != s:BlameWin() || get(l:mouse, 'line', 0) <= 0
         return
     endif
-    " 比 'mousetime' 多留一个很小的调度余量，保证第二次 mouse-down
-    " 可以先取消 pending 单击。
+    " 比 'mousetime' 多留一个很小的调度余量；双击的第二击/拖拽会先进入
+    " Visual 模式，RunMouseClick 的 mode() 校验会放弃过期单击。
     let s:mouse_click_timer = timer_start(&mousetime + 25,
                 \ {timer -> s:RunMouseClick(timer, l:mouse.winid, l:mouse.line)})
 endfunction
