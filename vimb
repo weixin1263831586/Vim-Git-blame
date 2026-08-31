@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 
 usage() {
     cat <<'EOF'
@@ -39,6 +39,25 @@ die() {
     printf 'vimb: %s\n' "$*" >&2
     exit 1
 }
+
+# Android 构建环境（source build/envsetup.sh 后）会把 <tree>/out/.path 插到
+# PATH 最前做白名单拦截，白名单外的工具（vim、dirname 等）会被拒绝执行。
+# 启动前剔除所有 */out/.path 拦截段，让 vimb 及其子进程走正常 PATH 解析；
+# 非构建环境下没有任何 PATH 项命中该模式，此处等于无操作。
+strip_path_interposers() {
+    local cleaned='' entry
+    local IFS=:
+    for entry in $PATH; do
+        case "$entry" in
+            */out/.path) ;;
+            *) cleaned="${cleaned:+$cleaned:}$entry" ;;
+        esac
+    done
+    [ -n "$cleaned" ] || return 0
+    PATH=$cleaned
+    export PATH
+}
+strip_path_interposers
 
 VIMB_REPO_RAW="https://raw.githubusercontent.com/weixin1263831586/Vim-Git-blame"
 VIMB_REPO_API_TIP="https://api.github.com/repos/weixin1263831586/Vim-Git-blame/commits/main"

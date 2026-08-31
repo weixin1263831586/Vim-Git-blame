@@ -33,6 +33,7 @@ run_installer() {
         VIMB_REF=local-test \
         VIMB_SHA256="$LOCAL_SHA256" \
         BIN_DIR="$WORK/install-bin" \
+        HOME="$WORK/home" \
         bash "$ROOT/install.sh"
 }
 
@@ -40,14 +41,37 @@ run_installer_latest() {
     env PATH="$WORK/mock-bin:$PATH" \
         VIMB_INSTALL_TEST_SOURCE="$1" \
         BIN_DIR="$WORK/install-bin" \
+        HOME="$WORK/home" \
         "${@:2}" \
         bash "$ROOT/install.sh"
 }
 
+mkdir -p "$WORK/home"
 run_installer "$ROOT/vimb" >/dev/null
 cmp -s "$ROOT/vimb" "$WORK/install-bin/vimb"
 [ -x "$WORK/install-bin/vimb" ]
 [ "$("$WORK/install-bin/vimb" --version)" = "vimb ${LOCAL_VERSION#v}" ]
+
+# shell 别名：自动写入 bashrc；重复安装幂等；换 BIN_DIR 重装自动更新托管块
+[ "$(grep -c 'vimb-installer:begin' "$WORK/home/.bashrc")" -eq 1 ]
+grep -q "alias vimb='$WORK/install-bin/vimb'" "$WORK/home/.bashrc"
+run_installer "$ROOT/vimb" >/dev/null
+[ "$(grep -c 'vimb-installer:begin' "$WORK/home/.bashrc")" -eq 1 ]
+grep -q "alias vimb='$WORK/install-bin/vimb'" "$WORK/home/.bashrc"
+env PATH="$WORK/mock-bin:$PATH" \
+    VIMB_INSTALL_TEST_SOURCE="$ROOT/vimb" \
+    VIMB_VERSION="$LOCAL_VERSION" \
+    VIMB_REF=local-test \
+    VIMB_SHA256="$LOCAL_SHA256" \
+    BIN_DIR="$WORK/install-bin2" \
+    HOME="$WORK/home" \
+    bash "$ROOT/install.sh" >/dev/null
+[ "$(grep -c 'vimb-installer:begin' "$WORK/home/.bashrc")" -eq 1 ]
+grep -q "alias vimb='$WORK/install-bin2/vimb'" "$WORK/home/.bashrc"
+if grep -q "alias vimb='$WORK/install-bin/vimb'" "$WORK/home/.bashrc"; then
+    printf 'FAIL installer left stale alias for old BIN_DIR\n' >&2
+    exit 1
+fi
 
 cp "$ROOT/vimb" "$WORK/tampered-vimb"
 printf '\n# tampered\n' >>"$WORK/tampered-vimb"

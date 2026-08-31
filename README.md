@@ -41,6 +41,8 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/weixin12
 VIMB_REF=<commit> VIMB_SHA256=<该 commit 中 vimb 的 SHA-256> sh install.sh
 ```
 
+安装器还会在 `~/.bashrc`（zsh 为 `~/.zshrc`）写入绝对路径别名 `alias vimb='...'`：Android 构建环境（`source build/envsetup.sh` 后）会经 `out/.path` 拦截白名单外的 PATH 命令（含 vimb），别名绕过拦截；vimb 启动时会自行剔除 PATH 中的 `*/out/.path` 拦截段，vim/git 等子进程不受影响。该托管块在重复安装时自动更新而非追加。
+
 或手动安装：
 
 ```bash

@@ -379,6 +379,25 @@ EOF
 }
 cli_update
 
+# Android 构建环境兼容：PATH 首段是伪 out/.path 拦截器（白名单外工具一律
+# 拒绝执行）。vimb 必须剔除拦截段，否则自身调用的 vim/dirname/git 会失败。
+path_interposer_setup() {
+    local fake="$WORK/android-out/out/.path" tool
+    mkdir -p "$fake"
+    cat >"$WORK/android-out/out/.path_interposer" <<'EOF'
+#!/bin/sh
+printf '"%s" is not allowed to be used (test interposer)\n' "${0##*/}" >&2
+exit 1
+EOF
+    chmod 755 "$WORK/android-out/out/.path_interposer"
+    for tool in vim git dirname readlink mktemp curl wget; do
+        ln -sf ../.path_interposer "$fake/$tool"
+    done
+}
+path_interposer_setup
+run_case path_interposer code.c basic.vim '' \
+    "PATH=$WORK/android-out/out/.path:$PATH"
+
 log "=== 结果: $pass 通过, $fail 失败 ==="
 if [ "$fail" -gt 0 ]; then
     log "失败用例:$failed_names"

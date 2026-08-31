@@ -113,4 +113,53 @@ case ":$PATH:" in
         ;;
 esac
 
+# ---------------------------------------------------------------------------
+# shell 别名：Android 构建环境（source build/envsetup.sh 后）经 out/.path 拦截
+# 白名单外的命令（含 vimb 自身），用绝对路径别名绕过；vimb 2.4.1+ 启动时会
+# 自行剔除 PATH 中的 */out/.path 段，vim/git 等子进程不受影响。
+# 别名块由安装器托管（vimb-installer:begin/end 标记），重复安装自动更新而非追加。
+install_shell_alias() { # install_shell_alias <vimb 绝对路径>
+    local target=$1 rc_file='' block tmp action
+    [ -n "${HOME:-}" ] || { msg "提示: 未设置 HOME，跳过 shell 别名配置"; return 0; }
+    case "${SHELL:-bash}" in
+        */zsh) rc_file=$HOME/.zshrc ;;
+        */fish)
+            msg "提示: 检测到 fish shell，请自行创建别名: alias vimb '$target'"
+            return 0
+            ;;
+        *) rc_file=$HOME/.bashrc ;;
+    esac
+    block="# vimb-installer:begin
+# Android 构建环境（source build/envsetup.sh 后）经 out/.path 拦截白名单外命令（含 vimb），
+# 用绝对路径别名绕过；vimb 启动时会自行剔除 PATH 中的 */out/.path 段
+alias vimb='$target'
+# vimb-installer:end"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/vimb-rc.XXXXXX")
+    if [ -f "$rc_file" ] && grep -qF '# vimb-installer:begin' "$rc_file"; then
+        action=更新
+        sed "/^# vimb-installer:begin\$/,/^# vimb-installer:end\$/d" "$rc_file" >"$tmp"
+    else
+        action=添加
+        if [ -f "$rc_file" ]; then
+            cat "$rc_file" >"$tmp"
+        fi
+    fi
+    if [ -s "$tmp" ] && [ "$(tail -c1 "$tmp")" != '' ]; then
+        printf '\n' >>"$tmp"
+    fi
+    printf '%s\n' "$block" >>"$tmp"
+    if cat "$tmp" >"$rc_file" 2>/dev/null; then
+        msg "已$action shell 别名到 $rc_file: alias vimb='$target'"
+    else
+        msg "提示: 无法写入 $rc_file，请手动添加: alias vimb='$target'"
+    fi
+    rm -f "$tmp"
+}
+
+case "$BIN_DIR" in
+    /*) alias_target=$BIN_DIR/vimb ;;
+    *)  alias_target=$PWD/$BIN_DIR/vimb ;;
+esac
+install_shell_alias "$alias_target"
+
 msg "完成。运行 vimb --help 查看用法；vimb --update 可自更新到最新版本。"
