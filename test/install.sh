@@ -15,9 +15,12 @@ cat >"$WORK/mock-bin/curl" <<'EOF'
 set -eu
 case "$*" in
     *api.github.com*)
-        # VIMB_INSTALL_TEST_SHA 为空时模拟 API 不可用（空响应）
+        # VIMB_INSTALL_TEST_SHA 为空时模拟 API 不可用（空响应）。
+        # 真实 /commits/<ref> 响应除顶层 sha 外还带 tree/parents/files 的
+        # sha 字段，ref 解析必须只取第一个。
         if [ -n "${VIMB_INSTALL_TEST_SHA:-}" ]; then
-            printf '{"sha":"%s"}\n' "$VIMB_INSTALL_TEST_SHA"
+            printf '{"sha":"%s",\n "commit":{"tree":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},\n "parents":[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],\n "files":[{"sha":"cccccccccccccccccccccccccccccccccccccccc"},{"sha":"dddddddddddddddddddddddddddddddddddddddd"}]}\n' \
+                "$VIMB_INSTALL_TEST_SHA"
         fi
         exit 0
         ;;
@@ -34,7 +37,7 @@ run_installer() {
         VIMB_SHA256="$LOCAL_SHA256" \
         BIN_DIR="$WORK/install-bin" \
         HOME="$WORK/home" \
-        bash "$ROOT/install.sh"
+        sh "$ROOT/install.sh"
 }
 
 run_installer_latest() {
@@ -43,7 +46,7 @@ run_installer_latest() {
         BIN_DIR="$WORK/install-bin" \
         HOME="$WORK/home" \
         "${@:2}" \
-        bash "$ROOT/install.sh"
+        sh "$ROOT/install.sh"
 }
 
 mkdir -p "$WORK/home"
@@ -65,7 +68,7 @@ env PATH="$WORK/mock-bin:$PATH" \
     VIMB_SHA256="$LOCAL_SHA256" \
     BIN_DIR="$WORK/install-bin2" \
     HOME="$WORK/home" \
-    bash "$ROOT/install.sh" >/dev/null
+    sh "$ROOT/install.sh" >/dev/null
 [ "$(grep -c 'vimb-installer:begin' "$WORK/home/.bashrc")" -eq 1 ]
 grep -q "alias vimb='$WORK/install-bin2/vimb'" "$WORK/home/.bashrc"
 if grep -q "alias vimb='$WORK/install-bin/vimb'" "$WORK/home/.bashrc"; then
@@ -85,7 +88,7 @@ if env PATH="$WORK/mock-bin:$PATH" \
         VIMB_VERSION=v9.9.9 \
         VIMB_REF=test-ref \
         BIN_DIR="$WORK/install-bin" \
-        bash "$ROOT/install.sh" >/dev/null 2>&1; then
+        sh "$ROOT/install.sh" >/dev/null 2>&1; then
     printf 'FAIL installer accepted a custom version/ref without VIMB_SHA256\n' >&2
     exit 1
 fi
@@ -98,6 +101,11 @@ run_installer_latest "$ROOT/vimb" \
 cmp -s "$ROOT/vimb" "$WORK/install-bin/vimb"
 [ -x "$WORK/install-bin/vimb" ]
 grep -q 'ref=1111111111111111111111111111111111111111' "$WORK/latest.out"
+# 多 sha 的 API 响应不得泄漏到 ref：输出里不允许出现整行为 40 位 hex 的行
+if grep -q '^[0-9a-f]\{40\}$' "$WORK/latest.out"; then
+    printf 'FAIL installer resolved multiple shas from API response\n' >&2
+    exit 1
+fi
 
 # 默认模式：API 不可用时回退到 main 引用，仍能安装
 rm -f "$WORK/install-bin/vimb"

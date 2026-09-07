@@ -56,8 +56,8 @@ if [ -z "$REF" ]; then
     REF=''
     if API_JSON=$(fetch "$API_TIP" 2>/dev/null); then
         REF=$(printf '%s\n' "$API_JSON" \
-            | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p')
-        REF=${REF%%$'\n'*}
+            | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' \
+            | head -n 1)
     fi
     if [ -n "$REF" ]; then
         msg "main 最新提交: $REF"
