@@ -64,7 +64,6 @@ let s:closing_blame = 0
 let s:closing_commit = 0
 let s:file_options = {}
 let s:file_maps = {}
-let s:file_visual_maps = {}
 let s:return_view = {}
 let s:pending_records = []
 " Git 执行层：默认走 job_start() 异步；!has('job') 或 VIMB_SYNC=1 时同步。
@@ -74,6 +73,14 @@ let s:job_seq = 0
 let s:blame_gen = 0
 let s:commit_gen = 0
 let s:mouse_click_timer = -1
+" 观察式选区复制：CursorMoved/ModeChanged 触发防抖定时器
+let s:visual_copy_timer = -1
+let s:visual_observer_timer = -1
+let s:visual_signature = []
+let s:last_visual_copy = ''
+let s:commit_apply_timer = -1
+" 刷新结果延迟应用：选区进行中不得改动布局
+let s:blame_apply_timer = -1
 let s:clipboard_job_seq = 0
 let s:clipboard_jobs = {}
 let s:commit_cache = {}
@@ -135,6 +142,43 @@ function! s:Info(message) abort
     echohl ModeMsg
     echo 'vimb: ' . a:message
     echohl None
+endfunction
+
+" Visual/Select 进行中（鼠标双击/拖拽/键盘 Visual 都算）。异步回调
+" （blame 刷新等）不得在此期间改动窗口布局/光标/滚动。
+function! s:SelectionActive() abort
+    return index(['v', 'V', nr2char(22), 's', 'S', nr2char(19)],
+                \ mode(1)) >= 0
+endfunction
+
+" 当前缓冲区是否属于 vimb 工作区（源文件/blame/commit/history/历史层）
+function! s:VisualGateBuffer() abort
+    return index([s:file_bufnr, s:blame_bufnr, s:commit_bufnr,
+                \ s:history_bufnr] + values(s:src_bufs), bufnr('%')) >= 0
+endfunction
+
+" +clipboard 的 Vim：启用原生 autoselect（选区即进系统剪贴板/主选择区），
+" 双击/拖拽/键盘 Visual 全部由 Vim 内建机制完成复制；关闭 blame 时还原。
+let s:clipboard_orig = &clipboard
+function! s:EnableNativeAutoselect() abort
+    if !has('clipboard')
+        return
+    endif
+    for l:flag in ['autoselect', 'autoselectplus']
+        try
+            if index(split(&clipboard, ','), l:flag) < 0
+                execute 'set clipboard+=' . l:flag
+            endif
+        catch
+            " 个别构建缺少该 flag，尽力而为
+        endtry
+    endfor
+endfunction
+
+function! s:DisableNativeAutoselect() abort
+    if &clipboard !=# s:clipboard_orig
+        let &clipboard = s:clipboard_orig
+    endif
 endfunction
 
 function! s:WindowMatches(winid, bufnr) abort

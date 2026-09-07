@@ -29,11 +29,31 @@ while [ \$# -gt 0 ]; do
     esac
 done
 if [ "\$mode" = in ]; then
-    cat >"\$VIMB_FAKE_CLIP_DIR/\$sel" 2>/dev/null
+    tmp=\$(mktemp "\$VIMB_FAKE_CLIP_DIR/input.XXXXXX")
+    cat >"\$tmp"
+    [ "\$(cat "\$tmp")" = slow-clipboard-write ] && sleep 0.7
+    mv "\$tmp" "\$VIMB_FAKE_CLIP_DIR/\$sel"
 fi
 exit 0
 EOF
 chmod +x "$WORK/bin/xclip"
+
+# 慢速 git 垫身：blame 子命令延迟 0.9s，让异步刷新回调落在双击选区
+# 保持期间（场景 7 的竞态回归）；show 延迟 2.5s 给场景 10 留足余量，
+# 高负载下双击输入被延迟处理时回调也不会抢先在普通模式应用。
+# 其他子命令不受影响。
+mkdir -p "$WORK/slowbin"
+cat >"$WORK/slowbin/git" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        blame) sleep 0.9 ;;
+        show) sleep 2.5 ;;
+    esac
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$WORK/slowbin/git"
 
 env GIT_AUTHOR_DATE='2024-01-01T00:00:00' \
     GIT_COMMITTER_DATE='2024-01-01T00:00:00' \
@@ -43,7 +63,7 @@ env GIT_AUTHOR_DATE='2024-01-01T00:00:00' \
 git -C "$FIXTURE" add code.txt
 git -C "$FIXTURE" -c commit.gpgsign=false commit -q -m initial
 
-PATH="$WORK/bin:$PATH" VIMB="$ROOT/vimb" \
+PATH="$WORK/bin:$WORK/slowbin:$PATH" VIMB="$ROOT/vimb" \
     VIMB_E2E_FIXTURE="$FIXTURE" VIMB_FAKE_CLIP_DIR="$CLIPDIR" \
     python3 "$ROOT/test/mouse_e2e.py"
 rc=$?

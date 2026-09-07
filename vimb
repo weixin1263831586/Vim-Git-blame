@@ -326,7 +326,6 @@ let s:closing_blame = 0
 let s:closing_commit = 0
 let s:file_options = {}
 let s:file_maps = {}
-let s:file_visual_maps = {}
 let s:return_view = {}
 let s:pending_records = []
 " Git 执行层：默认走 job_start() 异步；!has('job') 或 VIMB_SYNC=1 时同步。
@@ -336,6 +335,14 @@ let s:job_seq = 0
 let s:blame_gen = 0
 let s:commit_gen = 0
 let s:mouse_click_timer = -1
+" 观察式选区复制：CursorMoved/ModeChanged 触发防抖定时器
+let s:visual_copy_timer = -1
+let s:visual_observer_timer = -1
+let s:visual_signature = []
+let s:last_visual_copy = ''
+let s:commit_apply_timer = -1
+" 刷新结果延迟应用：选区进行中不得改动布局
+let s:blame_apply_timer = -1
 let s:clipboard_job_seq = 0
 let s:clipboard_jobs = {}
 let s:commit_cache = {}
@@ -397,6 +404,43 @@ function! s:Info(message) abort
     echohl ModeMsg
     echo 'vimb: ' . a:message
     echohl None
+endfunction
+
+" Visual/Select 进行中（鼠标双击/拖拽/键盘 Visual 都算）。异步回调
+" （blame 刷新等）不得在此期间改动窗口布局/光标/滚动。
+function! s:SelectionActive() abort
+    return index(['v', 'V', nr2char(22), 's', 'S', nr2char(19)],
+                \ mode(1)) >= 0
+endfunction
+
+" 当前缓冲区是否属于 vimb 工作区（源文件/blame/commit/history/历史层）
+function! s:VisualGateBuffer() abort
+    return index([s:file_bufnr, s:blame_bufnr, s:commit_bufnr,
+                \ s:history_bufnr] + values(s:src_bufs), bufnr('%')) >= 0
+endfunction
+
+" +clipboard 的 Vim：启用原生 autoselect（选区即进系统剪贴板/主选择区），
+" 双击/拖拽/键盘 Visual 全部由 Vim 内建机制完成复制；关闭 blame 时还原。
+let s:clipboard_orig = &clipboard
+function! s:EnableNativeAutoselect() abort
+    if !has('clipboard')
+        return
+    endif
+    for l:flag in ['autoselect', 'autoselectplus']
+        try
+            if index(split(&clipboard, ','), l:flag) < 0
+                execute 'set clipboard+=' . l:flag
+            endif
+        catch
+            " 个别构建缺少该 flag，尽力而为
+        endtry
+    endfor
+endfunction
+
+function! s:DisableNativeAutoselect() abort
+    if &clipboard !=# s:clipboard_orig
+        let &clipboard = s:clipboard_orig
+    endif
 endfunction
 
 function! s:WindowMatches(winid, bufnr) abort
@@ -969,7 +1013,7 @@ function! s:UpdateCompactStatusline() abort
 endfunction
 
 function! s:FileCursorMoved() abort
-    if s:syncing || s:refreshing || win_getid() != s:SourceWin()
+    if s:syncing || s:refreshing || s:SelectionActive() || win_getid() != s:SourceWin()
         return
     endif
     let l:bw = s:BlameWin()
@@ -992,7 +1036,7 @@ function! s:FileCursorMoved() abort
 endfunction
 
 function! s:BlameCursorMoved() abort
-    if s:syncing || s:refreshing || win_getid() != s:BlameWin()
+    if s:syncing || s:refreshing || s:SelectionActive() || win_getid() != s:BlameWin()
         return
     endif
     let l:fw = s:SourceWin()
@@ -1016,37 +1060,16 @@ function! s:SaveFileMap(lhs) abort
                 \ ? l:mapping : {}
 endfunction
 
-function! s:SaveFileVisualMap(lhs) abort
-    let l:mapping = maparg(a:lhs, 'v', 0, 1)
-    let s:file_visual_maps[a:lhs] = !empty(l:mapping)
-                \ && get(l:mapping, 'buffer', 0) ? l:mapping : {}
-endfunction
-
-" 所有 vimb 可读窗口共用：不映射 <2-LeftMouse>（及三击/四击），双击选词、
-" 三击选行、拖拽选区全部保持 Vim 原生行为（含 Visual 模式下的锚点重置）。
-" 只在 Visual 模式释放左键时复制 '< '> 标记记录的选区并保持高亮。
-" RHS 必须先重放同一个 release 事件，让 Vim 内建逻辑用真实松手坐标
-" 落定选区终点；终端可能合并最后几个 drag 事件，若直接调复制函数，
-" 就会只复制到上一个 drag 坐标。noremap 保证这个内建事件不会递归。
-function! s:InstallCopyMouseMaps() abort
-    for l:ev in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
-                \ '<4-LeftRelease>']
-        execute 'vnoremap <buffer> <silent> ' . l:ev
-                    \ . ' ' . l:ev
-                    \ . ':<C-U>call <SID>CopyMouseSelection()<CR>'
-    endfor
-endfunction
+" 鼠标事件零映射：单击/双击/三击/拖拽及全部 release 事件都保持 Vim 原生
+" 行为，选区复制由全局观察器旁路完成（见 remote.vim 的
+" InstallVisualObserver），blame 的单击打开 commit 也只依赖 Normal 模式
+" 下的 <LeftRelease> + 延时判定，不与 Visual 状态机竞争。
 
 function! s:InstallActiveFileMaps() abort
     let s:file_maps = {}
-    let s:file_visual_maps = {}
     for l:lhs in ['<F5>', '<CR>', '<Tab>', '<BS>', 'i', 'y', 'o',
                 \ 'gh', 'gl']
         call s:SaveFileMap(l:lhs)
-    endfor
-    for l:lhs in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
-                \ '<4-LeftRelease>']
-        call s:SaveFileVisualMap(l:lhs)
     endfor
     nnoremap <buffer> <silent> <F5> :call <SID>Refresh(1)<CR>
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommitAtFileLine()<CR>
@@ -1057,7 +1080,6 @@ function! s:InstallActiveFileMaps() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gh :call <SID>ShowFileHistory()<CR>
     nnoremap <buffer> <silent> gl :call <SID>ShowLineHistory()<CR>
-    call s:InstallCopyMouseMaps()
 endfunction
 
 function! s:RestoreActiveFileMapsHere() abort
@@ -1069,16 +1091,7 @@ function! s:RestoreActiveFileMapsHere() abort
             call mapset('n', 0, l:mapping)
         endif
     endfor
-    for l:lhs in ['<LeftRelease>', '<2-LeftRelease>', '<3-LeftRelease>',
-                \ '<4-LeftRelease>']
-        execute 'silent! vunmap <buffer> ' . l:lhs
-        let l:mapping = get(s:file_visual_maps, l:lhs, {})
-        if !empty(l:mapping)
-            call mapset('v', 0, l:mapping)
-        endif
-    endfor
     let s:file_maps = {}
-    let s:file_visual_maps = {}
 endfunction
 
 function! s:ActivateFile() abort
@@ -1087,6 +1100,8 @@ function! s:ActivateFile() abort
     setlocal nowrap
     setlocal noscrollbind
     call s:InstallActiveFileMaps()
+    call s:EnableNativeAutoselect()
+    call s:InstallVisualObserver()
     augroup VimbWorkspace
         autocmd! * <buffer>
         autocmd CursorMoved <buffer> call <SID>FileCursorMoved()
@@ -1096,6 +1111,8 @@ function! s:ActivateFile() abort
 endfunction
 
 function! s:DeactivateFile() abort
+    call s:RemoveVisualObserver()
+    call s:DisableNativeAutoselect()
     let l:fw = s:SourceWin()
     execute 'autocmd! VimbWorkspace * <buffer=' . s:file_bufnr . '>'
     if l:fw
@@ -1129,8 +1146,7 @@ function! s:ConfigureBlameBuffer() abort
 
     " 单击要等双击判定窗口结束再打开 commit；否则第一次 release 就改变
     " 布局，第二次点击既无法构成双击，也无法选择/复制 blame 文本。
-    nnoremap <buffer> <silent> <LeftRelease> :call <SID>ScheduleMouseClick()<CR>
-    call s:InstallCopyMouseMaps()
+    nnoremap <buffer> <silent> <expr> <LeftRelease> <SID>ScheduleMouseClick()
     nnoremap <buffer> <silent> <CR> :call <SID>ShowCommit()<CR>
     nnoremap <buffer> <silent> <Tab> :call <SID>PushOlder()<CR>
     nnoremap <buffer> <silent> <BS> :call <SID>PopNewer()<CR>
@@ -1149,6 +1165,7 @@ function! s:ConfigureBlameBuffer() abort
     augroup VimbWorkspace
         autocmd! * <buffer>
         autocmd WinEnter <buffer> call <SID>AuxFocusWithoutSource()
+        autocmd WinLeave <buffer> call <SID>CancelMouseClick()
         autocmd CursorMoved <buffer> call <SID>BlameCursorMoved()
         autocmd BufWipeout <buffer> call <SID>BlameGone()
     augroup END
@@ -1181,7 +1198,6 @@ function! s:ConfigureCommitBuffer() abort
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> gb :call <SID>CloseBlame()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
-    call s:InstallCopyMouseMaps()
 
     augroup VimbWorkspace
         autocmd! * <buffer>
@@ -1192,6 +1208,7 @@ endfunction
 function! s:BlameRequest(mode, notify) abort
     " mode: 'open' 首次打开 / 'refresh' 刷新 / 'push' 入栈 / 'pop' 出栈
     let s:blame_gen += 1
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     let l:gen = s:blame_gen
     let l:bw = s:blame_winid
@@ -1236,8 +1253,14 @@ function! s:BlameLoaded(mode, notify, ok, lines, gen, bw, fw) abort
     endif
 endfunction
 
-" 用当前层记录填充 blame 窗口，并按源窗口行号对齐
+" 用当前层记录填充 blame 窗口，并按源窗口行号对齐。
+" 选区进行中（Visual/Select，含 :w 后立即双击的场景）必须延迟：填充/
+" resize/对齐会改窗口宽度、移动光标、重设滚动，直接打断正在形成的选区。
 function! s:ApplyBlameRecords(bw, fw) abort
+    if s:SelectionActive() && s:WindowMatches(a:bw, s:blame_bufnr)
+        call s:DeferBlameApply(a:bw, a:fw)
+        return
+    endif
     let s:refreshing = 1
     let s:pending_records = s:stack[-1].records
     try
@@ -1255,6 +1278,38 @@ function! s:ApplyBlameRecords(bw, fw) abort
         let s:pending_records = []
         let s:refreshing = 0
     endtry
+endfunction
+
+" 延迟到回到 Normal 再应用；120ms 轮询直到选区自然结束。不设强制
+" 应用的时限：长时间按住选区是合法状态（观察式复制依赖它），打断它
+" 正是延迟应用要避免的问题；关闭 blame/窗口失配时定时器自会清理。
+function! s:DeferBlameApply(bw, fw) abort
+    call s:CancelDeferredBlameApply()
+    if !exists('*timer_start')
+        return
+    endif
+    let s:blame_apply_timer = timer_start(120,
+                \ {timer -> s:BlameApplyTick(timer, a:bw, a:fw)},
+                \ {'repeat': -1})
+endfunction
+
+function! s:BlameApplyTick(timer, bw, fw) abort
+    if !s:active || !s:WindowMatches(a:bw, s:blame_bufnr)
+        call s:CancelDeferredBlameApply()
+        return
+    endif
+    if s:SelectionActive()
+        return
+    endif
+    call s:CancelDeferredBlameApply()
+    call s:ApplyBlameRecords(a:bw, a:fw)
+endfunction
+
+function! s:CancelDeferredBlameApply() abort
+    if s:blame_apply_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:blame_apply_timer)
+    endif
+    let s:blame_apply_timer = -1
 endfunction
 
 function! s:OpenBlame() abort
@@ -1473,7 +1528,6 @@ function! s:ShowLayerInSource(layer) abort
                         \ . ' :call <SID>Toggle()<CR>')
             call win_execute(l:sw, 'nnoremap <buffer> <silent> ?'
                         \ . ' :call <SID>Help()<CR>')
-            call win_execute(l:sw, 'VimbInstallCopyMouseMaps')
             call setbufvar(a:layer.bufnr, 'vimb_maps_done', 1)
             augroup VimbWorkspace
                 execute 'autocmd CursorMoved <buffer=' . a:layer.bufnr . '>'
@@ -1766,7 +1820,6 @@ function! s:ConfigureHistoryBuffer(kind) abort
     nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
-    call s:InstallCopyMouseMaps()
 
     augroup VimbWorkspace
         autocmd! * <buffer>
@@ -2120,6 +2173,7 @@ function! s:HistoryRevisionLoaded(ok, lines, record, target_line, cur_layer, gen
                 \ a:cur_layer, a:gen)
 endfunction
 function! s:RenderCommit(record, file_only) abort
+    call s:CancelDeferredCommitApply()
     let l:path = s:RecordPath(a:record)
     let b:vimb_hash = a:record.hash
     let b:vimb_file_only = a:file_only
@@ -2147,6 +2201,16 @@ function! s:CommitRendered(ok, lines, gen, cw, title, rule, summary) abort
     if a:gen != s:commit_gen || !s:WindowMatches(a:cw, s:commit_bufnr)
         return
     endif
+    " Git 回调不能替换正在选择的内容，也不能通过 win_execute 改动选区。
+    if s:SelectionActive() && exists('*timer_start')
+        call s:CancelDeferredCommitApply()
+        let s:commit_apply_timer = timer_start(120,
+                    \ {timer -> s:CommitRendered(a:ok, a:lines, a:gen,
+                    \     a:cw, a:title, a:rule, a:summary)})
+        return
+    endif
+    call s:CancelDeferredCommitApply()
+    let l:view = s:CaptureView(a:cw)
     if !a:ok
         call s:Error(s:GitFailure(a:lines))
         call win_execute(a:cw,
@@ -2156,9 +2220,16 @@ function! s:CommitRendered(ok, lines, gen, cw, title, rule, summary) abort
     let l:content = [a:title, a:rule, ''] + a:lines
     call win_execute(a:cw,
                 \ 'call s:ReplaceCurrentBuffer(' . string(l:content) . ')')
-    call win_execute(a:cw, 'normal! gg')
+    call s:RestoreView(a:cw, l:view)
     call s:Info(strpart(getbufvar(winbufnr(a:cw), 'vimb_hash'), 0, 12) . '  '
                 \ . (empty(a:summary) ? getbufvar(winbufnr(a:cw), 'vimb_summary', '') : a:summary))
+endfunction
+
+function! s:CancelDeferredCommitApply() abort
+    if s:commit_apply_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:commit_apply_timer)
+    endif
+    let s:commit_apply_timer = -1
 endfunction
 
 function! s:OpenCommitForRecord(record) abort
@@ -2270,6 +2341,7 @@ function! s:ReturnToFile() abort
 endfunction
 
 function! s:CloseCommit(return_to_file) abort
+    call s:CancelDeferredCommitApply()
     let s:commit_gen += 1
     call s:CancelGitJobs('commit')
     let l:cw = s:CommitWin()
@@ -2289,6 +2361,7 @@ function! s:CloseCommit(return_to_file) abort
 endfunction
 
 function! s:CommitGone() abort
+    call s:CancelDeferredCommitApply()
     let s:commit_winid = -1
     let s:commit_bufnr = -1
     if !s:closing_commit && !s:closing_blame
@@ -2297,6 +2370,7 @@ function! s:CommitGone() abort
 endfunction
 function! s:CloseBlame() abort
     call s:CancelMouseClick()
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let l:fw = s:SourceWin()
@@ -2328,6 +2402,7 @@ function! s:CloseBlame() abort
 endfunction
 
 function! s:BlameGone() abort
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let s:blame_winid = -1
@@ -2411,7 +2486,8 @@ endfunction
 
 function! s:RunMouseClick(timer, winid, line) abort
     let s:mouse_click_timer = -1
-    if a:winid != s:BlameWin() || a:line <= 0
+    if a:winid != s:BlameWin() || win_getid() != a:winid
+                \ || a:line <= 0 || line('.') != a:line
         return
     endif
     " 单击只在窗口始终停留在 Normal 模式时才生效：双击的第二击、拖拽都会
@@ -2430,17 +2506,17 @@ endfunction
 function! s:ScheduleMouseClick() abort
     call s:CancelMouseClick()
     if !exists('*getmousepos') || !exists('*timer_start')
-        call s:MouseClick()
-        return
+        return "\<LeftRelease>"
     endif
     let l:mouse = getmousepos()
     if get(l:mouse, 'winid', 0) != s:BlameWin() || get(l:mouse, 'line', 0) <= 0
-        return
+        return "\<LeftRelease>"
     endif
     " 比 'mousetime' 多留一个很小的调度余量；双击的第二击/拖拽会先进入
     " Visual 模式，RunMouseClick 的 mode() 校验会放弃过期单击。
     let s:mouse_click_timer = timer_start(&mousetime + 25,
                 \ {timer -> s:RunMouseClick(timer, l:mouse.winid, l:mouse.line)})
+    return "\<LeftRelease>"
 endfunction
 
 function! s:Toggle() abort
@@ -2538,6 +2614,12 @@ function! s:ClipboardJobDone(token, status) abort
         return
     endif
     let l:state = remove(s:clipboard_jobs, a:token)
+    if has_key(l:state, 'next')
+        " 同一剪贴板串行写入，只保留最新待写文本，防止慢的旧任务覆盖新选区。
+        call s:CopyWithClipboardJob(l:state.command,
+                    \ l:state.next.text, l:state.next.fallback)
+        return
+    endif
     " DISPLAY 存在不等于 X11 连接可用。后台命令失败时，
     " clipboard 主任务再回退 OSC 52；primary 只是尽力而为。
     if a:status != 0 && get(l:state, 'fallback', 0)
@@ -2552,10 +2634,16 @@ function! s:StartClipboardJob(command, text, fallback) abort
     if !has('job') || !exists('*ch_sendraw') || !exists('*ch_close_in')
         return 0
     endif
+    for l:state in values(s:clipboard_jobs)
+        if l:state.command ==# a:command
+            let l:state.next = {'text': a:text, 'fallback': a:fallback}
+            return 1
+        endif
+    endfor
     let s:clipboard_job_seq += 1
     let l:token = s:clipboard_job_seq
     let s:clipboard_jobs[l:token] = {'job': 0, 'text': a:text,
-                \ 'fallback': a:fallback}
+                \ 'fallback': a:fallback, 'command': a:command}
     let l:job = job_start(['/bin/sh', '-c', a:command], {
                 \ 'in_io': 'pipe',
                 \ 'out_io': 'null',
@@ -2563,7 +2651,7 @@ function! s:StartClipboardJob(command, text, fallback) abort
                 \ 'exit_cb': {job, status -> s:ClipboardJobDone(
                 \     l:token, status)},
                 \ })
-    if type(l:job) == v:t_number && l:job == 0
+    if (type(l:job) == v:t_number && l:job == 0) || job_status(l:job) ==# 'fail'
         call remove(s:clipboard_jobs, l:token)
         return 0
     endif
@@ -2590,8 +2678,11 @@ endfunction
 
 function! s:CopyWithNativeClipboard(text) abort
     if executable('wl-copy') && $WAYLAND_DISPLAY !=# ''
-        return s:CopyWithClipboardJob('wl-copy', a:text, 1)
-                    \ ? 'wl-copy' : ''
+        if !s:CopyWithClipboardJob('wl-copy', a:text, 1)
+            return ''
+        endif
+        call s:CopyWithClipboardJob('wl-copy --primary', a:text, 0)
+        return 'wl-copy'
     elseif executable('xclip') && $DISPLAY !=# ''
         if !s:CopyWithClipboardJob(
                     \ 'xclip -selection clipboard -in', a:text, 1)
@@ -2654,12 +2745,13 @@ endfunction
 " 支持时才代表系统剪贴板；没有该特性时寄存器只是 Vim 内部存储，回读校验
 " 不可信，必须继续尝试可验证的本地剪贴板命令，最后才回退到无法从应用侧
 " 确认是否被终端接受的 OSC 52。
-function! s:CopyText(text) abort
-    let @" = a:text
+function! s:CopyText(text, ...) abort
+    let l:type = a:0 ? a:1 : 'v'
+    call setreg('"', a:text, l:type)
     if has('clipboard')
         for l:reg in ['+', '*']
             try
-                call setreg(l:reg, a:text)
+                call setreg(l:reg, a:text, l:type)
             catch
             endtry
         endfor
@@ -2674,29 +2766,258 @@ function! s:CopyText(text) abort
     return s:SendOSC52(a:text) ? 'osc52' : 'vim'
 endfunction
 
-" 释放左键时的统一复制入口。Visual 模式下按键映射里的 Ex 命令执行前，
-" Vim 会先把选区转成 '< '> 标记并退出 Visual——所以这里不检查 mode()，
-" 直接用 gvy 取回完整选区（双击选词 / 三击选行 / 拖拽选区都覆盖），
-" 复制完成后再 gv 恢复选区高亮，与原生 Vim 的双击体验一致。
-function! s:CopyMouseSelection() abort
+" ---- 观察式选区复制 --------------------------------------------------------
+" <LeftMouse>/<LeftDrag>/<LeftRelease> 及双击/三击/四击全部保持 Vim 原生
+" 行为，不做任何映射。全局 CursorMoved/ModeChanged 只是旁路观察：选区
+" 一变化就重启 120ms 防抖定时器，光标静止（选区稳定）后才复制。读取选区
+" 用 getpos('.')/getpos('v') 纯函数计算，不执行 normal!，不写 '< '> 标记，
+" 不打断进行中的选区（双击释放后高亮原样保留）。
+
+function! s:InstallVisualObserver() abort
+    call s:RemoveVisualObserver()
+    augroup VimbObserver
+        autocmd!
+        autocmd CursorMoved * call <SID>OnSelectionMotion()
+        if exists('##ModeChanged')
+            autocmd ModeChanged * call <SID>OnSelectionMotion()
+        endif
+        autocmd WinLeave,BufLeave * call <SID>ResetVisualCopy()
+    augroup END
+    " 只动锚点（如右键扩展）或旧版 Vim 缺少 ModeChanged 时，CursorMoved
+    " 不一定触发。轻量轮询比较坐标，文本仅在选区稳定时读取一次。
+    if exists('*timer_start')
+        let s:visual_observer_timer = timer_start(60,
+                    \ {timer -> s:OnSelectionMotion()}, {'repeat': -1})
+    endif
+endfunction
+
+function! s:RemoveVisualObserver() abort
+    augroup VimbObserver
+        autocmd!
+    augroup END
+    if s:visual_observer_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:visual_observer_timer)
+    endif
+    let s:visual_observer_timer = -1
+    call s:ResetVisualCopy()
+endfunction
+
+function! s:ResetVisualCopy() abort
+    call s:CancelVisualCopyTimer()
+    let s:visual_signature = []
+    let s:last_visual_copy = ''
+endfunction
+
+function! s:CancelVisualCopyTimer() abort
+    if s:visual_copy_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:visual_copy_timer)
+    endif
+    let s:visual_copy_timer = -1
+endfunction
+
+function! s:OnSelectionMotion() abort
+    if !s:SelectionActive() || !s:VisualGateBuffer()
+        " 已离开选区：停表，并允许下一次选区重新复制相同文本
+        call s:ResetVisualCopy()
+        return
+    endif
+    let l:signature = [win_getid(), bufnr('%'), b:changedtick, mode(1),
+                \ getpos('v'), getpos('.'), &selection, &virtualedit,
+                \ &tabstop, &vartabstop, winsaveview().curswant]
+    if l:signature ==# s:visual_signature
+        return
+    endif
+    let s:visual_signature = l:signature
+    " 双击/拖拽先进入 Visual：单击打开 commit 面板的待判定定时器让位
     call s:CancelMouseClick()
-    if line("'<") <= 0 || line("'>") <= 0
+    call s:CancelVisualCopyTimer()
+    if exists('*timer_start')
+        let s:visual_copy_timer = timer_start(120,
+                    \ {timer -> s:VisualCopyTick(timer)})
+    endif
+endfunction
+
+function! s:VisualCopyTick(timer) abort
+    let s:visual_copy_timer = -1
+    if s:SelectionActive()
+        call s:CopyStableSelection()
+    endif
+endfunction
+
+" 测试钩子：立即执行一次“选区已稳定”复制（等同防抖定时器到期）
+function! s:VisualCopyNow() abort
+    call s:CopyStableSelection()
+endfunction
+
+function! s:CopyStableSelection() abort
+    if !s:VisualGateBuffer()
         return
     endif
-    silent normal! gvy
-    let l:text = @"
-    if empty(l:text)
+    " 选区进行中读实时选区；刚结束（防抖 tick 落在退出之后）读 '< '>
+    if !s:SelectionActive() && line("'<") <= 0
         return
     endif
-    " 先恢复并绘制选区，再等待 xclip/wl-copy 等系统剪贴板命令。
-    " SSH/X11 下 xclip 可能需要一两秒；若先复制后 gv，期间屏幕没有任何
-    " 选中反馈，会被误认为没有响应。
-    silent normal! gv
-    redraw
-    let l:backend = s:CopyText(l:text)
-    call s:Info('已复制 ' . s:ClipDisplayText(
-                \ substitute(l:text, '\n', ' ', 'g'), 40)
-                \ . s:ClipboardStatus(l:backend))
+    let l:text = s:VisualSelectionText()
+    let l:type = s:VisualSelectionType()
+    if l:type ==# nr2char(22)
+        let l:bounds = s:VisualBlockBounds(
+                    \ s:SelectionActive() ? getpos('v') : getpos("'<"),
+                    \ s:SelectionActive() ? getpos('.') : getpos("'>"))
+        let l:type .= max([1, l:bounds[1] - l:bounds[0] + 1])
+    endif
+    let l:copy = string([l:type, l:text])
+    if empty(l:text) || l:copy ==# s:last_visual_copy
+        return
+    endif
+    let s:last_visual_copy = l:copy
+    " 自动复制不 echo，保留 Vim 原生的 Visual/Select 模式提示。
+    call s:CopyText(l:text, l:type)
+endfunction
+
+function! s:VisualSelectionType() abort
+    let l:kind = s:SelectionActive() ? mode(1) : visualmode()
+    return get({'s': 'v', 'S': 'V', nr2char(19): nr2char(22)}, l:kind, l:kind)
+endfunction
+
+" 纯函数读取当前 Visual/Select 选区文本（结果等价于对应模式的 yank）。
+" 选区进行中用 'v' 标记与光标；刚离开选区（Ex 命令会把 Visual 转成
+" '< '> 标记并退出，脚本/定时器上下文无法避免）则回退读 '< '> 与
+" visualmode()，两者描述的是同一个选区。
+function! s:VisualSelectionText() abort
+    let l:kind = s:VisualSelectionType()
+    if s:SelectionActive()
+        let l:anchor = getpos('v')
+        let l:cursor = getpos('.')
+    else
+        let l:anchor = getpos("'<")
+        let l:cursor = getpos("'>")
+    endif
+    if l:anchor[1] <= 0 || l:cursor[1] <= 0
+        return ''
+    endif
+    let l:sl = min([l:anchor[1], l:cursor[1]])
+    let l:el = max([l:anchor[1], l:cursor[1]])
+    if l:kind ==# 'V'
+        return join(getline(l:sl, l:el), "\n") . "\n"
+    endif
+    if l:kind ==# nr2char(22)
+        let l:virtual = &virtualedit =~# '\<\(all\|block\)\>'
+        let [l:left, l:right] = s:VisualBlockBounds(l:anchor, l:cursor)
+        let l:parts = []
+        for l:n in range(l:sl, l:el)
+            call add(l:parts, s:SliceScreenCols(getline(l:n), l:left, l:right,
+                        \ l:virtual))
+        endfor
+        return join(l:parts, "\n")
+    endif
+    if exists('*getregion')
+        " getregion 会省略 exclusive 选区在下一行第 1 列的空尾段；
+        " yank 的字符寄存器仍保留前一行换行。
+        let l:end = l:anchor[1] > l:cursor[1] ? l:anchor : l:cursor
+        let l:linebreak = &selection ==# 'exclusive' && l:sl < l:el
+                    \ && l:end[2] == 1 ? "\n" : ''
+        return join(getregion(l:anchor, l:cursor,
+                    \ {'type': l:kind, 'exclusive': &selection ==# 'exclusive'}), "\n")
+                    \ . l:linebreak . s:VisualTrailingNewline(l:anchor, l:cursor)
+    endif
+    " 起止列：跨行时各自取所在行的端点，同行时按列序（可反向选择）
+    if l:anchor[1] < l:cursor[1]
+        let l:sc = l:anchor[2]
+        let l:ec = l:cursor[2]
+    elseif l:cursor[1] < l:anchor[1]
+        let l:sc = l:cursor[2]
+        let l:ec = l:anchor[2]
+    else
+        let l:sc = min([l:anchor[2], l:cursor[2]])
+        let l:ec = max([l:anchor[2], l:cursor[2]])
+    endif
+    let l:exclusive = &selection ==# 'exclusive'
+                \ && (l:sl != l:el || l:sc != l:ec)
+    " 字符-wise：锚点行从锚点列起，止于光标字符（含）
+    let l:parts = []
+    for l:n in range(l:sl, l:el)
+        let l:c1 = l:n == l:sl ? l:sc : 1
+        let l:c2 = l:n == l:el ? l:ec : strlen(getline(l:n)) + 1
+        if l:n == l:el && l:exclusive
+            call add(l:parts, strpart(getline(l:n), l:c1 - 1, l:c2 - l:c1))
+        else
+            call add(l:parts, s:SliceVisualCols(getline(l:n), l:c1, l:c2))
+        endif
+    endfor
+    return join(l:parts, "\n") . s:VisualTrailingNewline(l:anchor, l:cursor)
+endfunction
+
+function! s:VisualBlockBounds(anchor, cursor) abort
+    let l:virtual = &virtualedit =~# '\<\(all\|block\)\>'
+    let l:reverse = a:anchor[1] > a:cursor[1]
+                \ || (a:anchor[1] == a:cursor[1] && a:anchor[2] > a:cursor[2])
+    let l:a = s:VisualScreenSpan(l:reverse ? a:cursor : a:anchor, l:virtual)
+    let l:c = s:VisualScreenSpan(l:reverse ? a:anchor : a:cursor, l:virtual)
+    let l:left = min([l:a[0], l:c[0]])
+    let l:right = max([l:a[1], l:c[1]])
+    " 与 Vim block operator 一致：按缓冲区位置排序后，仅缩短右伸的终点。
+    if &selection ==# 'exclusive' && l:c[0] > l:a[1]
+        let l:right = l:c[0] - 1
+    endif
+    if winsaveview().curswant == 2147483647
+        let l:lines = getline(min([a:anchor[1], a:cursor[1]]),
+                    \ max([a:anchor[1], a:cursor[1]]))
+        let l:right = max(map(l:lines, 'strdisplaywidth(v:val)')) + 1
+    endif
+    return [l:left, l:right]
+endfunction
+
+function! s:VisualTrailingNewline(anchor, cursor) abort
+    let l:end = a:anchor[1] > a:cursor[1]
+                \ || (a:anchor[1] == a:cursor[1] && a:anchor[2] > a:cursor[2])
+                \ ? a:anchor : a:cursor
+    let l:empty = a:anchor[1:2] ==# a:cursor[1:2] && empty(getline(l:end[1]))
+    return &selection !=# 'old' && &virtualedit !~# '\<all\>'
+                \ && (l:empty || (&selection !=# 'exclusive'
+                \ && l:end[2] > strlen(getline(l:end[1])))) ? "\n" : ''
+endfunction
+
+" 字节位置转成屏幕列范围：Tab/全角字符可能占多列。
+function! s:VisualScreenSpan(pos, virtual) abort
+    let l:text = getline(a:pos[1])
+    let l:start = strdisplaywidth(strpart(l:text, 0, a:pos[2] - 1)) + 1
+    let l:char = matchstr(strpart(l:text, a:pos[2] - 1), '.')
+    if a:virtual
+        return [l:start + a:pos[3], l:start + a:pos[3]]
+    endif
+    return [l:start, l:start + max([1, strdisplaywidth(l:char, l:start - 1)]) - 1]
+endfunction
+
+function! s:SliceScreenCols(text, left, right, pad) abort
+    let l:result = ''
+    let l:col = 1
+    for l:char in split(a:text, '\zs')
+        let l:width = strdisplaywidth(l:char, l:col - 1)
+        let l:end = l:col + l:width - 1
+        if l:end >= a:left && l:col <= a:right
+            let l:result .= l:col >= a:left && l:end <= a:right
+                        \ ? l:char : repeat(' ', min([l:end, a:right]) - max([l:col, a:left]) + 1)
+        endif
+        let l:col += l:width
+        if l:col > a:right
+            break
+        endif
+    endfor
+    if a:pad && l:col <= a:right
+        let l:result .= repeat(' ', a:right - max([l:col, a:left]) + 1)
+    endif
+    return l:result
+endfunction
+
+" 按字节列切片 [c1, c2]：c2 为字符首字节时包含该完整字符（多字节安全；
+" col()/strlen 均为字节单位，且总是落在字符边界上）
+function! s:SliceVisualCols(text, c1, c2) abort
+    if a:c1 > strlen(a:text)
+        return ''
+    endif
+    let l:tail = strpart(a:text, a:c2 - 1)
+    let l:endlen = empty(l:tail) ? 0 : strlen(matchstr(l:tail, '.'))
+    return strpart(a:text, a:c1 - 1, a:c2 - a:c1 + l:endlen)
 endfunction
 
 " o：在浏览器打开 commit
@@ -2812,8 +3133,8 @@ command! -bar VimbPopulatePendingBlame call <SID>PopulatePendingBlame()
 command! -bar VimbRestoreFileMaps call <SID>RestoreActiveFileMapsHere()
 command! -bar VimbAlignBlame call <SID>AlignBlameToSource()
 command! -nargs=1 VimbCopyText call <SID>CopyText(<q-args>)
-command! -bar VimbCopyMouseSelection call <SID>CopyMouseSelection()
-command! -bar VimbInstallCopyMouseMaps call <SID>InstallCopyMouseMaps()
+command! -bar VimbVisualCopyNow call <SID>VisualCopyNow()
+command! -bar VimbVisualText let g:vimb_visual_text = <SID>VisualSelectionText()
 
 " 内部测试钩子：等待所有后台 Git job 结束（带超时），无 job 时立即返回。
 function! s:WaitJobs() abort

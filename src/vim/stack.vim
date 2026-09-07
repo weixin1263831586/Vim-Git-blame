@@ -162,7 +162,6 @@ function! s:ShowLayerInSource(layer) abort
                         \ . ' :call <SID>Toggle()<CR>')
             call win_execute(l:sw, 'nnoremap <buffer> <silent> ?'
                         \ . ' :call <SID>Help()<CR>')
-            call win_execute(l:sw, 'VimbInstallCopyMouseMaps')
             call setbufvar(a:layer.bufnr, 'vimb_maps_done', 1)
             augroup VimbWorkspace
                 execute 'autocmd CursorMoved <buffer=' . a:layer.bufnr . '>'

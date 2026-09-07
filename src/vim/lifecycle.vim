@@ -1,5 +1,6 @@
 function! s:CloseBlame() abort
     call s:CancelMouseClick()
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let l:fw = s:SourceWin()
@@ -31,6 +32,7 @@ function! s:CloseBlame() abort
 endfunction
 
 function! s:BlameGone() abort
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     call s:InvalidateTrace()
     let s:blame_winid = -1
@@ -114,7 +116,8 @@ endfunction
 
 function! s:RunMouseClick(timer, winid, line) abort
     let s:mouse_click_timer = -1
-    if a:winid != s:BlameWin() || a:line <= 0
+    if a:winid != s:BlameWin() || win_getid() != a:winid
+                \ || a:line <= 0 || line('.') != a:line
         return
     endif
     " 单击只在窗口始终停留在 Normal 模式时才生效：双击的第二击、拖拽都会
@@ -133,17 +136,17 @@ endfunction
 function! s:ScheduleMouseClick() abort
     call s:CancelMouseClick()
     if !exists('*getmousepos') || !exists('*timer_start')
-        call s:MouseClick()
-        return
+        return "\<LeftRelease>"
     endif
     let l:mouse = getmousepos()
     if get(l:mouse, 'winid', 0) != s:BlameWin() || get(l:mouse, 'line', 0) <= 0
-        return
+        return "\<LeftRelease>"
     endif
     " 比 'mousetime' 多留一个很小的调度余量；双击的第二击/拖拽会先进入
     " Visual 模式，RunMouseClick 的 mode() 校验会放弃过期单击。
     let s:mouse_click_timer = timer_start(&mousetime + 25,
                 \ {timer -> s:RunMouseClick(timer, l:mouse.winid, l:mouse.line)})
+    return "\<LeftRelease>"
 endfunction
 
 function! s:Toggle() abort

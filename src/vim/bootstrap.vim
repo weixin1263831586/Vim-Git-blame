@@ -25,8 +25,8 @@ command! -bar VimbPopulatePendingBlame call <SID>PopulatePendingBlame()
 command! -bar VimbRestoreFileMaps call <SID>RestoreActiveFileMapsHere()
 command! -bar VimbAlignBlame call <SID>AlignBlameToSource()
 command! -nargs=1 VimbCopyText call <SID>CopyText(<q-args>)
-command! -bar VimbCopyMouseSelection call <SID>CopyMouseSelection()
-command! -bar VimbInstallCopyMouseMaps call <SID>InstallCopyMouseMaps()
+command! -bar VimbVisualCopyNow call <SID>VisualCopyNow()
+command! -bar VimbVisualText let g:vimb_visual_text = <SID>VisualSelectionText()
 
 " 内部测试钩子：等待所有后台 Git job 结束（带超时），无 job 时立即返回。
 function! s:WaitJobs() abort

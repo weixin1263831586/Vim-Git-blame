@@ -10,7 +10,7 @@
 - blame 栏与文件窗口双向同步光标位置，`scrollbind` 联动滚动
 - 当前行的 commit 自动高亮，同属一个 commit 的所有行一起标出
 - 鼠标单击或 Enter 查看该行所属 commit 的完整信息（fuller 格式 + stat + patch）
-- 双击/三击/拖拽完全沿用 Vim 原生选区行为；在任意面板释放左键即自动把完整选区复制到剪贴板（双击选词、三击选行），并保持选区高亮；优先使用 Vim/system clipboard、`wl-copy`/`xclip`/`xsel` 等本地接口（X11 下同时更新主选择区，支持中键粘贴），远程终端回退到 OSC 52
+- 鼠标事件零映射：双击/三击/拖拽完全沿用 Vim 原生选区行为，vimb 只在旁路观察——选区稳定（约 120ms 无变化）后自动把完整选区复制到剪贴板，进行中的选区高亮不受任何干扰；带 `+clipboard` 的 Vim 同时启用原生 `clipboard=autoselect`，无此特性时优先走 `wl-copy`/`xclip`/`xsel` 等本地接口（X11 下同时更新主选择区，支持中键粘贴），远程终端回退到 OSC 52；`:w` 触发的异步 blame 刷新若赶上选区进行中，会延迟到选区结束后再应用，不与双击/拖拽抢状态
 - **Tab 向前追溯**：基于 `previous` 字段入栈显示历史版本文件，rename/移动过的代码自动跟随旧路径；Backspace 逐层返回，blame 栏显示当前深度（如 `vimb blame 2 层 @79583ef`）
 - blame 视觉增强：连续相同 commit 的行合并显示（块首行显示作者/日期）、相邻 commit 块循环底色区分（256 色终端）、按当前时间计算的代码年龄热力（hash 列按新旧绿→蓝→灰着色）
 - 源窗口状态栏常驻显示当前行 commit 摘要（current-line compact 模式），关闭 blame 后恢复
@@ -92,8 +92,8 @@ Gerrit 用户：SSH 远端 `ssh://user@gerrit.host:29418/project` 可自动识�
 | 按键 | 位置 | 作用 |
 | --- | --- | --- |
 | 鼠标单击 / Enter | blame 栏或文件 | 查看该行所属 commit |
-| 鼠标双击 | 源码 / blame / commit / history | 原生选词 + 释放自动复制到剪贴板 |
-| 鼠标拖拽 | 源码 / blame / commit / history | 原生选区 + 释放自动复制完整文本 |
+| 鼠标双击 | 源码 / blame / commit / history | 原生选词 + 选区稳定后自动复制到剪贴板 |
+| 鼠标拖拽 | 源码 / blame / commit / history | 原生选区 + 选区稳定后自动复制完整文本 |
 | Tab | blame 栏或文件 | 追溯该行到引入它的上一版（入栈，跟随 rename） |
 | Tab | history commit 行 | 进入所选 revision（跟随当时路径） |
 | Backspace | blame 栏或文件 | 返回较新版本（出栈） |
@@ -139,7 +139,7 @@ bash scripts/verify-release-payload.sh  # 下载并验证安装器默认路径�
 
 `src/vim/` 使用职责明确的语义化文件名；模块加载顺序只由 `scripts/build.sh` 的 `MODULES` 清单决定，不依赖目录遍历或文件名排序。构建脚本会拒绝缺失、重复以及未登记的 `.vim` 模块，避免新增文件被静默遗漏。所有模块最终拼进同一个 Vim script，共享 script-local (`s:`) 命名空间；当前依赖顺序为 `state → git → commit_cache → visual → ui → blame → stack → history → commit_panel → lifecycle → remote → bootstrap`。新增跨模块调用时，应确保提供者排在使用者之前，并同步更新 `MODULES` 清单。
 
-测试覆盖：普通文件、文件名含空格、中文文件名/作者显示宽度、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项/带引号状态栏/用户映射、syntax off 保持、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**blame revision 坐标映射**/**多 hunk 映射**/**新增行拦截**/**Tab 关闭与双击竞态**、快捷键与 URL 构造（含 Gerrit SSH 远端）、交互式文件/行历史（含 rename 旧路径 revision）、历史层行历史、异步关闭竞态、blame 附加参数、256 色大文件视觉路径、CLI `--` 解析；另有 pty + SGR 真实鼠标序列的端到端测试（首次/连续双击复制、拖拽复制、blame 双击不误开面板、双击后拖拽扩展选区、commit 面板复制），无需真实 X 显示。
+测试覆盖：普通文件、文件名含空格、中文文件名/作者显示宽度、空文件、WORKTREE 未提交行、rename 文件（含历史追溯跨旧路径、UTF-8 文件名 rename 后追溯）、CRLF、2 万行大文件、保存自动刷新、关闭 blame 恢复窗口选项/带引号状态栏/用户映射、syntax off 保持、fold 状态、commit 面板打开与范围切换、历史栈入栈/出栈/边界行/**blame revision 坐标映射**/**多 hunk 映射**/**新增行拦截**/**Tab 关闭与双击竞态**、快捷键与 URL 构造（含 Gerrit SSH 远端）、交互式文件/行历史（含 rename 旧路径 revision）、历史层行历史、异步关闭竞态、blame 附加参数、256 色大文件视觉路径、CLI `--` 解析；另有 pty + SGR 真实鼠标序列的端到端测试（首次/连续双击复制、拖拽复制、blame 双击不误开面板、双击后拖拽扩展选区、commit 面板复制、`:w` 触发异步 blame 刷新期间双击不被打断的延迟应用竞态），无需真实 X 显示。
 
 CI 会验证 Vim 8.2.1119、Vim 9.0 与最新稳定版，并组合覆盖异步/同步 Git 路径及低色彩/256 色终端；构建后还会确认 `vimb` 与 `src/` 完全一致。
 

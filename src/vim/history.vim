@@ -32,7 +32,6 @@ function! s:ConfigureHistoryBuffer(kind) abort
     nnoremap <buffer> <silent> y :call <SID>YankHash()<CR>
     nnoremap <buffer> <silent> o :call <SID>OpenInBrowser()<CR>
     nnoremap <buffer> <silent> ? :call <SID>Help()<CR>
-    call s:InstallCopyMouseMaps()
 
     augroup VimbWorkspace
         autocmd! * <buffer>

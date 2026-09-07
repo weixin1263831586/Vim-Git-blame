@@ -1,6 +1,7 @@
 function! s:BlameRequest(mode, notify) abort
     " mode: 'open' 首次打开 / 'refresh' 刷新 / 'push' 入栈 / 'pop' 出栈
     let s:blame_gen += 1
+    call s:CancelDeferredBlameApply()
     call s:CancelGitJobs('blame')
     let l:gen = s:blame_gen
     let l:bw = s:blame_winid
@@ -45,8 +46,14 @@ function! s:BlameLoaded(mode, notify, ok, lines, gen, bw, fw) abort
     endif
 endfunction
 
-" 用当前层记录填充 blame 窗口，并按源窗口行号对齐
+" 用当前层记录填充 blame 窗口，并按源窗口行号对齐。
+" 选区进行中（Visual/Select，含 :w 后立即双击的场景）必须延迟：填充/
+" resize/对齐会改窗口宽度、移动光标、重设滚动，直接打断正在形成的选区。
 function! s:ApplyBlameRecords(bw, fw) abort
+    if s:SelectionActive() && s:WindowMatches(a:bw, s:blame_bufnr)
+        call s:DeferBlameApply(a:bw, a:fw)
+        return
+    endif
     let s:refreshing = 1
     let s:pending_records = s:stack[-1].records
     try
@@ -64,6 +71,38 @@ function! s:ApplyBlameRecords(bw, fw) abort
         let s:pending_records = []
         let s:refreshing = 0
     endtry
+endfunction
+
+" 延迟到回到 Normal 再应用；120ms 轮询直到选区自然结束。不设强制
+" 应用的时限：长时间按住选区是合法状态（观察式复制依赖它），打断它
+" 正是延迟应用要避免的问题；关闭 blame/窗口失配时定时器自会清理。
+function! s:DeferBlameApply(bw, fw) abort
+    call s:CancelDeferredBlameApply()
+    if !exists('*timer_start')
+        return
+    endif
+    let s:blame_apply_timer = timer_start(120,
+                \ {timer -> s:BlameApplyTick(timer, a:bw, a:fw)},
+                \ {'repeat': -1})
+endfunction
+
+function! s:BlameApplyTick(timer, bw, fw) abort
+    if !s:active || !s:WindowMatches(a:bw, s:blame_bufnr)
+        call s:CancelDeferredBlameApply()
+        return
+    endif
+    if s:SelectionActive()
+        return
+    endif
+    call s:CancelDeferredBlameApply()
+    call s:ApplyBlameRecords(a:bw, a:fw)
+endfunction
+
+function! s:CancelDeferredBlameApply() abort
+    if s:blame_apply_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:blame_apply_timer)
+    endif
+    let s:blame_apply_timer = -1
 endfunction
 
 function! s:OpenBlame() abort

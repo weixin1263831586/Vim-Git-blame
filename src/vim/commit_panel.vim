@@ -1,4 +1,5 @@
 function! s:RenderCommit(record, file_only) abort
+    call s:CancelDeferredCommitApply()
     let l:path = s:RecordPath(a:record)
     let b:vimb_hash = a:record.hash
     let b:vimb_file_only = a:file_only
@@ -26,6 +27,16 @@ function! s:CommitRendered(ok, lines, gen, cw, title, rule, summary) abort
     if a:gen != s:commit_gen || !s:WindowMatches(a:cw, s:commit_bufnr)
         return
     endif
+    " Git 回调不能替换正在选择的内容，也不能通过 win_execute 改动选区。
+    if s:SelectionActive() && exists('*timer_start')
+        call s:CancelDeferredCommitApply()
+        let s:commit_apply_timer = timer_start(120,
+                    \ {timer -> s:CommitRendered(a:ok, a:lines, a:gen,
+                    \     a:cw, a:title, a:rule, a:summary)})
+        return
+    endif
+    call s:CancelDeferredCommitApply()
+    let l:view = s:CaptureView(a:cw)
     if !a:ok
         call s:Error(s:GitFailure(a:lines))
         call win_execute(a:cw,
@@ -35,9 +46,16 @@ function! s:CommitRendered(ok, lines, gen, cw, title, rule, summary) abort
     let l:content = [a:title, a:rule, ''] + a:lines
     call win_execute(a:cw,
                 \ 'call s:ReplaceCurrentBuffer(' . string(l:content) . ')')
-    call win_execute(a:cw, 'normal! gg')
+    call s:RestoreView(a:cw, l:view)
     call s:Info(strpart(getbufvar(winbufnr(a:cw), 'vimb_hash'), 0, 12) . '  '
                 \ . (empty(a:summary) ? getbufvar(winbufnr(a:cw), 'vimb_summary', '') : a:summary))
+endfunction
+
+function! s:CancelDeferredCommitApply() abort
+    if s:commit_apply_timer != -1 && exists('*timer_stop')
+        call timer_stop(s:commit_apply_timer)
+    endif
+    let s:commit_apply_timer = -1
 endfunction
 
 function! s:OpenCommitForRecord(record) abort
@@ -149,6 +167,7 @@ function! s:ReturnToFile() abort
 endfunction
 
 function! s:CloseCommit(return_to_file) abort
+    call s:CancelDeferredCommitApply()
     let s:commit_gen += 1
     call s:CancelGitJobs('commit')
     let l:cw = s:CommitWin()
@@ -168,6 +187,7 @@ function! s:CloseCommit(return_to_file) abort
 endfunction
 
 function! s:CommitGone() abort
+    call s:CancelDeferredCommitApply()
     let s:commit_winid = -1
     let s:commit_bufnr = -1
     if !s:closing_commit && !s:closing_blame
